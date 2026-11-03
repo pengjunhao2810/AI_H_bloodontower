@@ -494,8 +494,13 @@ def _resolve_llm(llm_conf):
         base = DEEPSEEK_API_URL
     if not model:
         model = DEEPSEEK_MODEL
+    # 本地推理服务（Ollama / LM Studio 等）通常不需要 API Key
+    is_local = base.startswith("http://127.0.0.1") or base.startswith("http://localhost") or base.startswith("http://0.0.0.0")
     if not key:
-        return None, None, None
+        if is_local:
+            key = "ollama"
+        else:
+            return None, None, None
     return _chat_url(base), key, model
 
 def _chat_url(base):
@@ -680,6 +685,26 @@ _CHAT_END_WORDS = (
 
 def _is_chat_end(text):
     return any(w in text for w in _CHAT_END_WORDS)
+
+def _drop_prompt_leak(reply):
+    """小模型常见问题：把系统提示/上下文当台词复述。过滤提示词碎片、对话回显与复读。"""
+    if not reply:
+        return reply
+    leak_words = ("最近对话", "已去重", "发言要体现", "你永远不会说", "私密信息就在上面",
+                  "你的角色规范", "【最高优先级", "【你的关键私密信息", "输出格式",
+                  "你的目标是找出", "对话记录", "上下文", "系统提示", "私密信息")
+    kept = [ln for ln in reply.splitlines() if not any(w in ln for w in leak_words)]
+    txt = "\n".join(kept).strip()
+    if len(re.findall(r"#[0-9]+\s*[:：]", txt)) >= 2:
+        parts = re.split(r"(?=#[0-9]+\s*[:：])", txt)
+        txt = parts[0].strip() if parts else ""
+    if re.search(r"没(有)?看到.{0,8}记忆", txt):
+        return ""
+    txt = re.sub(r"(.{8,40}?)\1+", r"\1", txt).strip()
+    if len(re.sub(r"[\s\W_]+", "", txt)) < 4:
+        return ""
+    return txt
+
 
 def _sanitize_reply(reply, team="", phase=""):
     """后处理清洗：弱模型偶发泄露游戏外词汇/固定幻觉，直接替换为玩家口吻"""
@@ -1100,6 +1125,9 @@ def api_speak():
 
     # 身份一致性校验：提取声称身份写入笔记（下次生成时约束一致）
     reply = _sanitize_reply(reply, team, phase)
+    reply = _drop_prompt_leak(reply)
+    if reply == "":
+        return jsonify({"reply": "", "silent": True})
     _abl_incr("speak_total")
     if _ABLATE_FILTER:
         # 消融对照：关闭全部过滤关卡，发言原样返回（仅保留发言记忆写入）

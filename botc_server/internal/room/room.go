@@ -708,10 +708,12 @@ func (r *Room) onAddAI(ev Event, reply func(bool, string, map[string]any)) {
 			"base_url": strOr(ev.Data["base_url"]),
 			"model":    strOr(ev.Data["model"]),
 		}
-		// Ollama 本地模型（127.0.0.1:11434）允许无 Key；其他服务商必须填 Key
-
-		if cfg["api_key"] == "" && !strings.Contains(cfg["base_url"], "11434") {
-			reply(false, "请填?API Key（或选择无需 Key 的本地模型）", nil)
+		// 本地推理服务（Ollama / llama.cpp / LM Studio 等）允许无 Key；公网服务商必须填 Key
+		base := cfg["base_url"]
+		isLocal := strings.Contains(base, "127.0.0.1") || strings.Contains(base, "localhost") ||
+			strings.Contains(base, "0.0.0.0") || strings.Contains(base, "11434")
+		if cfg["api_key"] == "" && !isLocal {
+			reply(false, "请填写 API Key（或使用本地模型服务）", nil)
 			return
 		}
 		if b, err := json.Marshal(cfg); err == nil {
