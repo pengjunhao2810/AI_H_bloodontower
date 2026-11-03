@@ -1392,4 +1392,8 @@ def api_ask():
 
 if __name__ == "__main__":
     # 副本端口 8842（原项目 8742 不动）
-    app.run(host="127.0.0.1", port=int(os.environ.get("AI_PORT", "8842")), debug=False, threaded=True)
+    try:
+        _ai_port = int(os.environ.get("AI_PORT", "8842"))
+    except Exception:
+        _ai_port = 8842
+    app.run(host="127.0.0.1", port=_ai_port, debug=False, threaded=True)

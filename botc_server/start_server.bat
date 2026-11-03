@@ -5,10 +5,11 @@ cd /d %~dp0
 
 rem 用法: start_server.bat [端口] [AI服务地址]
 rem 默认: 8741  http://127.0.0.1:8742
-set PORT=%~1
-if "%PORT%"=="" set PORT=8741
-set AIURL=%~2
-if "%AIURL%"=="" set AIURL=http://127.0.0.1:8742
+set "PORT=%~1"
+if "%PORT%"=="" set "PORT=8741"
+echo %PORT%| findstr /r "^[0-9][0-9]*$" >nul || set "PORT=8741"
+set "AIURL=%~2"
+if "%AIURL%"=="" set "AIURL=http://127.0.0.1:8742"
 
 rem SQLite 驱动需要 CGO
 set CGO_ENABLED=1

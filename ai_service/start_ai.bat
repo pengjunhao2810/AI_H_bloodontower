@@ -5,8 +5,9 @@ cd /d %~dp0
 
 rem 用法: start_ai.bat [端口]
 rem 默认: 8742
-set PORT=%~1
-if "%PORT%"=="" set PORT=8742
+set "PORT=%~1"
+if "%PORT%"=="" set "PORT=8742"
+echo %PORT%| findstr /r "^[0-9][0-9]*$" >nul || set "PORT=8742"
 
 if not exist venv (
     echo [setup] creating venv ...
