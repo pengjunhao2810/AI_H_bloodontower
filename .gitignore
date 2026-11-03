@@ -1,0 +1,21 @@
+# 构建产物
+*.exe
+botc-server
+
+# 运行时数据
+botc_server/data/
+*.db
+*.log
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# 备份
+*.bak
+
+# 系统
+.DS_Store
+Thumbs.db

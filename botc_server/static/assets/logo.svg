@@ -1,0 +1,48 @@
+<svg width="64" height="64" viewBox="0 0 64 64" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="gold" x1="18" y1="4" x2="46" y2="60" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#f9edcf"/>
+      <stop offset="0.42" stop-color="#e2c48a"/>
+      <stop offset="1" stop-color="#a8843e"/>
+    </linearGradient>
+    <linearGradient id="blood" x1="12" y1="0" x2="52" y2="0" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#8b1a2b" stop-opacity="0"/>
+      <stop offset="0.5" stop-color="#b2263a" stop-opacity="0.85"/>
+      <stop offset="1" stop-color="#8b1a2b" stop-opacity="0"/>
+    </linearGradient>
+  </defs>
+
+  <!-- 外圈微光 -->
+  <circle cx="32" cy="32" r="28.4" stroke="url(#gold)" stroke-width="1.1" opacity="0.35"/>
+  <circle cx="32" cy="32" r="25.6" stroke="url(#gold)" stroke-width="0.7" opacity="0.14"/>
+
+  <!-- 塔尖 -->
+  <circle cx="32" cy="3.4" r="1.15" fill="url(#gold)"/>
+  <path d="M32 5.2 L40.6 16.9 H23.4 Z" fill="url(#gold)"/>
+  <!-- 檐口 -->
+  <path d="M22.2 16.9 H41.8 V19.3 H22.2 Z" fill="url(#gold)" opacity="0.92"/>
+  <!-- 塔身 -->
+  <path d="M24.2 19.3 H39.8 V47.6 H24.2 Z" fill="url(#gold)" opacity="0.9"/>
+  <path d="M27.1 19.3 V47.6" stroke="#3a2a12" stroke-width="0.7" opacity="0.45"/>
+  <path d="M36.9 19.3 V47.6" stroke="#3a2a12" stroke-width="0.7" opacity="0.45"/>
+
+  <!-- 钟面 -->
+  <circle cx="32" cy="28.2" r="6.5" fill="#0b0705" stroke="url(#gold)" stroke-width="1.35"/>
+  <circle cx="32" cy="28.2" r="4.7" stroke="url(#gold)" stroke-width="0.55" opacity="0.5"/>
+  <path d="M32 28.2 V23.9" stroke="url(#gold)" stroke-width="1.35" stroke-linecap="round"/>
+  <path d="M32 28.2 L35.5 30.4" stroke="url(#gold)" stroke-width="1.15" stroke-linecap="round"/>
+  <circle cx="32" cy="28.2" r="0.9" fill="url(#gold)"/>
+
+  <!-- 拱窗 -->
+  <path d="M28.3 47.6 V40.4 a3.7 3.7 0 0 1 7.4 0 V47.6 Z" fill="#0b0705" stroke="url(#gold)" stroke-width="1.15"/>
+  <path d="M32 36.9 V47.2" stroke="url(#gold)" stroke-width="0.7" opacity="0.55"/>
+
+  <!-- 基座 -->
+  <path d="M20.8 47.6 H43.2 V51.9 H20.8 Z" fill="url(#gold)" opacity="0.9"/>
+  <path d="M24.2 51.9 H39.8 V55 H24.2 Z" fill="url(#gold)" opacity="0.66"/>
+  <path d="M27.4 55 H36.6 V57.7 H27.4 Z" fill="url(#gold)" opacity="0.42"/>
+
+  <!-- 底部暗流 -->
+  <path d="M13 60.4c4.2-1.7 7.4-1.7 11.6 0 4.2 1.7 7.4 1.7 11.6 0 4.2-1.7 7.4-1.7 11.6 0"
+        stroke="url(#blood)" stroke-width="1.3" stroke-linecap="round" opacity="0.7"/>
+</svg>

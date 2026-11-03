@@ -1,0 +1,2078 @@
+/* 暗流涌动 — Vue3 应用逻辑
+ * 通信架构：WebSocket 全双工指令 + 服务器事件广播（无轮询）
+ * 协议：客户端 {event, data, id} → 服务端 {event, data} 广播 + {event:"ack", data:{id, ok, message, ...}} 回执
+ */
+(function () {
+    const { createApp, ref, reactive, computed } = Vue;
+    const { ElMessage } = ElementPlus;
+
+    // ——— WebSocket 客户端 ———
+    const WS = {
+        conn: null,
+        seq: 0,
+        pending: new Map(),
+        handlers: {},
+        retryDelay: 1000,
+        heartbeatTimer: null,
+
+        connect() {
+            this.manualClose = false;
+            const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+            this.conn = new WebSocket(proto + '://' + location.host + '/ws');
+            this.conn.onopen = () => {
+                this.retryDelay = 1000;
+                if (this.heartbeatTimer) clearInterval(this.heartbeatTimer);
+                this.heartbeatTimer = setInterval(() => {
+                    this.send('heartbeat', {}).catch(() => {});
+                }, 30000);
+                this.emit('_open', {});
+            };
+            this.conn.onmessage = (ev) => {
+                let msg;
+                try { msg = JSON.parse(ev.data); } catch (e) { return; }
+                if (msg.event === 'ack') {
+                    const p = this.pending.get(msg.data && msg.data.id);
+                    if (p) {
+                        this.pending.delete(msg.data.id);
+                        clearTimeout(p.timer);
+                        if (msg.data.ok) p.resolve(msg.data);
+                        else p.reject(new Error(msg.data.message || '指令失败'));
+                    }
+                    return;
+                }
+                this.emit(msg.event, msg.data);
+            };
+            this.conn.onclose = () => {
+                if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+                // 未完成的请求全部失败
+                this.pending.forEach(p => { clearTimeout(p.timer); p.reject(new Error('连接已断开')); });
+                this.pending.clear();
+                this.emit('_close', {});
+                if (this.manualClose) return; // 主动登出：不再自动重连
+                setTimeout(() => this.connect(), this.retryDelay);
+                this.retryDelay = Math.min(this.retryDelay * 2, 8000);
+            };
+            this.conn.onerror = () => { try { this.conn.close(); } catch (e) {} };
+        },
+
+        disconnect() {
+            this.manualClose = true;
+            if (this.heartbeatTimer) { clearInterval(this.heartbeatTimer); this.heartbeatTimer = null; }
+            try { if (this.conn) this.conn.close(); } catch (e) { /* 忽略 */ }
+        },
+
+        on(event, fn) {
+            (this.handlers[event] = this.handlers[event] || []).push(fn);
+            return () => {
+                const list = this.handlers[event] || [];
+                const i = list.indexOf(fn);
+                if (i >= 0) list.splice(i, 1);
+            };
+        },
+        emit(event, data) {
+            (this.handlers[event] || []).forEach(fn => { try { fn(data); } catch (e) {} });
+        },
+
+        send(event, data) {
+            return new Promise((resolve, reject) => {
+                const doSend = () => {
+                    if (!this.conn || this.conn.readyState !== WebSocket.OPEN) {
+                        reject(new Error('连接未就绪'));
+                        return;
+                    }
+                    const id = ++this.seq;
+                    const timer = setTimeout(() => {
+                        this.pending.delete(id);
+                        reject(new Error('指令超时'));
+                    }, 8000);
+                    this.pending.set(id, { resolve, reject, timer });
+                    this.conn.send(JSON.stringify({ event, data: data || {}, id }));
+                };
+                if (!this.conn || this.conn.readyState !== WebSocket.OPEN) {
+                    // 连接未建立：最多等待 5 秒（断线重连窗口内不发错误）
+                    let waited = 0;
+                    const t = setInterval(() => {
+                        waited += 400;
+                        if (this.conn && this.conn.readyState === WebSocket.OPEN) {
+                            clearInterval(t);
+                            doSend();
+                        } else if (waited >= 5000) {
+                            clearInterval(t);
+                            reject(new Error('连接未就绪'));
+                        }
+                    }, 400);
+                    return;
+                }
+                doSend();
+            });
+        },
+    };
+
+    const api = {
+        async post(url, body) {
+            const resp = await fetch(url, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(body || {}),
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data.message || ('HTTP ' + resp.status));
+            return data;
+        },
+        async get(url) {
+            const resp = await fetch(url);
+            const data = await resp.json().catch(() => ({}));
+            if (!resp.ok) throw new Error(data.message || ('HTTP ' + resp.status));
+            return data;
+        },
+    };
+
+    const app = createApp({
+        setup() {
+            // ——— 全局状态 ———
+            const view = ref('login');
+            const user = ref(null);
+            const busy = ref(false);
+            const loginForm = reactive({ username: '', password: '', captcha: '', email: '', phone: '' });
+            const isRegister = ref(false);
+            const joinCode = ref('');
+            const wsReady = ref(false);
+
+            // 房间
+            const roomCode = ref('');
+            const room = ref(null);
+            const roomMessages = ref([]);
+            const chatText = ref('');
+            // 斗蛐蛐房间：点击 AI 对话（问上一局体验/疑问）
+            const askAiChat = ref([]);
+            const askAiInput = ref('');
+            const askAiTarget = ref(null);
+            const askAiBusy = ref(false);
+            function askAiPlayer(p) {
+                if (!p || !p.is_ai) return;
+                askAiTarget.value = p;
+                if (!askAiChat.value.length) {
+                    askAiChat.value = [{ role: 'ai', name: p.username || 'AI', content: '你好，我是「' + (p.username || 'AI') + '」。想问什么？上一局我的体验、哪里信息不清晰，或者对某个玩家的看法都行。' }];
+                }
+            }
+            async function sendAskAi() {
+                const q = (askAiInput.value || '').trim();
+                if (!q || !askAiTarget.value) return;
+                askAiBusy.value = true;
+                const target = askAiTarget.value;
+                askAiChat.value.push({ role: 'user', name: '你', content: q });
+                askAiInput.value = '';
+                try {
+                    const resp = await api.post('/api/ask_ai', {
+                        number: target.seat_number + 1,
+                        username: target.username || 'AI',
+                        question: q,
+                        room_code: roomCode.value,
+                    });
+                    const ans = (resp && resp.data && resp.data.answer) || '（AI 没有回答）';
+                    askAiChat.value.push({ role: 'ai', name: target.username || 'AI', content: ans });
+                } catch (e) {
+                    askAiChat.value.push({ role: 'ai', name: target.username || 'AI', content: '（连接失败：' + e.message + '）' });
+                } finally {
+                    askAiBusy.value = false;
+                }
+            }
+            const seatCount = ref(8);
+
+            // 游戏
+            const game = ref(null);
+            const myNumber = ref(0);
+            const pubMsgs = ref([]);
+            const gameChatText = ref('');
+            // @ 提及：输入框以 @ 结尾时弹出玩家选择
+            const atMenuVisible = ref(false);
+            function onChatInput() {
+                const v = gameChatText.value || '';
+                atMenuVisible.value = !activePrivateTarget.value && gameTab.value === 'public' && v.endsWith('@');
+            }
+            function insertAt(p) {
+                gameChatText.value = (gameChatText.value || '').replace(/@$/, '') + '@#' + p.number + ' ';
+                atMenuVisible.value = false;
+            }
+            const myInfo = ref({ infos: [], my_role: '?', my_team: '?' });
+            const stories = ref([]);
+            const nightInfo = ref(null);
+            const infoDialog = ref(false);
+            const overDialog = ref(false);
+            const winner = ref('');
+            // 用户中心：排行榜/公示栏/资料
+            const leaderboardDialog = ref(false);
+            const leaderboard = ref([]);
+            async function openLeaderboard() {
+                leaderboardDialog.value = true;
+                try {
+                    const d = await api.get('/api/leaderboard');
+                    leaderboard.value = d.data.leaderboard || [];
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            const announcementsDialog = ref(false);
+            const announcements = ref([]);
+            async function openAnnouncements() {
+                announcementsDialog.value = true;
+                try {
+                    const d = await api.get('/api/announcements');
+                    announcements.value = d.data.announcements || [];
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            // 战绩与回放
+            const statsDialog = ref(false);
+            const stats = reactive({ total: 0, wins: 0, win_rate: 0 });
+            const myGames = ref([]);
+            const replayDialog = ref(false);
+            const replay = ref(null);
+            const modelStats = ref([]);
+            const modelStatsDialog = ref(false);
+            async function openStatsPanel() {
+                statsDialog.value = true;
+                try {
+                    const [s, g] = await Promise.all([
+                        api.get('/api/stats'),
+                        api.get('/api/games'),
+                    ]);
+                    stats.total = s.data.total || 0;
+                    stats.wins = s.data.wins || 0;
+                    stats.win_rate = s.data.win_rate || 0;
+                    myGames.value = g.data.games || [];
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function openModelStats() {
+                modelStatsDialog.value = true;
+                try {
+                    const ms = await api.get('/api/model_stats');
+                    modelStats.value = ms.data.models || [];
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function openReplay(id) {
+                try {
+                    const d = await api.get('/api/games/' + id + '/replay');
+                    replay.value = d.data;
+                    replayDialog.value = true;
+                } catch (e) { toast(e.message, 'error'); }
+            }
+
+            // 好友系统
+            const friendDialog = ref(false);
+            const friendList = reactive({ friends: [], incoming: [], outgoing: [] });
+            const friendSearch = ref('');
+            const searchResult = ref(null);
+            const inviteDialog = ref(false);
+            const inviteIncoming = ref(null);
+            const inviteIncomingVisible = computed({
+                get: () => inviteIncoming.value !== null,
+                set: (v) => { if (!v) inviteIncoming.value = null; },
+            });
+
+            // 夜晚行动选择已迁移至公聊定向提示（night_tip 消息），弹窗相关状态全部移除
+            let tipCountdownTimer = null;
+
+            // 提名投票状态
+            const voteInfo = ref(null); // {from, target, waiting, deadline, debate, debateDeadline}
+            const voteCountdown = ref(0);
+            const debateCountdown = ref(0);
+
+            // 私聊状态
+            const privatePhase = ref(false); // 是否处于私聊阶段
+            const privatePanelVisible = ref(false); // 私聊面板是否展开（收起后仍处于阶段中）
+            const privateChats = reactive({}); // 对象编号 -> 消息数组
+            const privateTarget = ref(null);   // 当前私聊对象编号
+            const activePrivateTarget = ref(null); // 私聊模式：非空时聊天面板整体切换为与该玩家的私聊对话
+            // 电子斗蛐蛐：上帝视角状态
+            const watchMode = ref(false);
+            const watchPrivateMsgs = ref([]);
+            const watchStories = ref([]); // 扁平日志，按时间戳排序（避免按玩家分组导致时间错位）
+            const arenaRecord = ref(null);
+            const arenaRecordDialog = ref(false);
+            // 玩家列表布局切换：垂直列表 / 环形座位
+            const layoutMode = ref('list');
+            function toggleLayout() {
+                layoutMode.value = layoutMode.value === 'list' ? 'circle' : 'list';
+                if (layoutMode.value === 'circle') setTimeout(measureCircleArea, 50);
+            }
+            // 环形座位容器实际尺寸（响应式测量，座位环与中心圆同心）
+            const circleAreaSize = ref({ w: 230, h: 320 });
+            function measureCircleArea() {
+                for (const id of ['circle-area', 'circle-area-room']) {
+                    const el = document.getElementById(id);
+                    if (el && el.clientWidth > 0) {
+                        circleAreaSize.value = { w: el.clientWidth, h: el.clientHeight };
+                        return;
+                    }
+                }
+            }
+            const circlePlayers = computed(() => {
+                const list = sortedPlayers.value;
+                const n = list.length;
+                if (!n) return [];
+                const { w, h } = circleAreaSize.value;
+                const cx = w / 2, cy = h / 2;
+                const r = Math.min(w, h) * 0.36;
+                return list.map((p, i) => {
+                    const angle = (2 * Math.PI * i) / n - Math.PI / 2;
+                    return { ...p, x: Math.round(cx + r * Math.cos(angle)), y: Math.round(cy + r * Math.sin(angle)) };
+                });
+            });
+            // 配板统计（优先用后端按真实阵营算好的数量；脱敏快照里角色是空的）
+            const teamCounts = computed(() => {
+                const t = game.value && game.value.team_counts;
+                if (t) {
+                    return { townsfolk: t.townsfolk || 0, outsider: t.outsider || 0, minion: t.minion || 0, demon: t.demon || 0 };
+                }
+                const c = { townsfolk: 0, outsider: 0, minion: 0, demon: 0 };
+                sortedPlayers.value.forEach(p => { if (c[p.team] !== undefined) c[p.team]++; });
+                return c;
+            });
+            // 房间等待阶段的环形座位（房主/AI 展示）
+            const roomCirclePlayers = computed(() => {
+                const list = roomPlayers.value;
+                const n = list.length;
+                if (!n) return [];
+                const { w, h } = circleAreaSize.value;
+                const cx = w / 2, cy = h / 2;
+                const r = Math.min(w, h) * 0.36;
+                return list.map((p, i) => {
+                    const angle = (2 * Math.PI * i) / n - Math.PI / 2;
+                    return { ...p, x: Math.round(cx + r * Math.cos(angle)), y: Math.round(cy + r * Math.sin(angle)) };
+                });
+            });
+            const watchTab = ref('private'); // 上帝视角右栏标签：public/private/story
+            const gameTab = ref('public');   // 普通对局右栏标签：public/private/story（与斗蛐蛐一致）
+            // 右栏标题：随标签/阶段变化
+            const panelTitle = computed(() => {
+                const tab = watchMode.value ? watchTab.value : gameTab.value;
+                if (tab === 'story') return watchMode.value ? '📜 说书人信息' : '📜 我的笔记';
+                if (tab === 'nightorder') return '🌙 夜晚顺序';
+                if (tab === 'roles') return '📖 角色技能';
+                if (tab === 'private') return activePrivateTarget.value ? ('🔒 私聊 #' + activePrivateTarget.value) : '🔒 私聊';
+                if (watchMode.value) return '💬 公聊';
+                if (game.value && game.value.phase === 'night') return '🌙 黑夜';
+                if (game.value && game.value.active_vote) return '⚖️ 辩论';
+                return '公聊';
+            });
+            // 提名冷却 → 天黑倒计时（每秒刷新）
+            const nowMs = ref(Date.now());
+            setInterval(() => { nowMs.value = Date.now(); }, 1000);
+            const nightCountdown = computed(() => {
+                const g = game.value;
+                if (watchMode.value) return 0;
+                if (!g || g.phase !== 'nomination' || g.active_vote) return 0;
+                const at = (g.night_at || 0) || (g.nom_cooldown_until || 0);
+                if (!at) return 0;
+                return Math.max(0, Math.round(at - nowMs.value / 1000));
+            });
+            const nightCountdownMode = computed(() => {
+                const g = game.value;
+                if (!g) return '';
+                if (g.night_at) return 'night';
+                if (g.nom_cooldown_until) return 'resolve';
+                return '';
+            });
+            const nightCountdownPct = computed(() => {
+                const total = nightCountdownMode.value === 'night' ? 10 : 60;
+                return Math.max(0, Math.min(100, (nightCountdown.value / total) * 100));
+            });
+            // 提名阶段剩余可提名时间（20 秒）
+            const nomIdleLeft = computed(() => {
+                const g = game.value;
+                if (watchMode.value) return 0;
+                if (!g || g.phase !== 'nomination' || g.active_vote || g.night_at) return 0;
+                const at = g.nom_idle_until || 0;
+                if (!at) return 0;
+                return Math.max(0, Math.round(at - nowMs.value / 1000));
+            });
+
+            // 倒计时卡片可拖动（位置记在本地）
+            const cdPos = ref({ x: 0, y: 12, set: false });
+            try {
+                const saved = JSON.parse(localStorage.getItem('botc_cd_pos') || 'null');
+                if (saved && typeof saved.x === 'number') cdPos.value = { ...saved, set: true };
+            } catch (e) { /* 忽略 */ }
+            function startCdDrag(e) {
+                const el = e.currentTarget;
+                const parent = el.parentElement.getBoundingClientRect();
+                const rect = el.getBoundingClientRect();
+                const offX = e.clientX - rect.left;
+                const offY = e.clientY - rect.top;
+                const move = (ev) => {
+                    let x = ev.clientX - parent.left - offX;
+                    let y = ev.clientY - parent.top - offY;
+                    x = Math.max(0, Math.min(parent.width - rect.width, x));
+                    y = Math.max(0, Math.min(parent.height - rect.height, y));
+                    cdPos.value = { x, y, set: true };
+                };
+                const up = () => {
+                    document.removeEventListener('mousemove', move);
+                    document.removeEventListener('mouseup', up);
+                    try { localStorage.setItem('botc_cd_pos', JSON.stringify(cdPos.value)); } catch (err) { /* 忽略 */ }
+                };
+                document.addEventListener('mousemove', move);
+                document.addEventListener('mouseup', up);
+                e.preventDefault();
+            }
+
+            // 私聊 / 公聊阶段剩余秒数
+            const phaseLeft = computed(() => {
+                const g = game.value;
+                if (!g || !g.phase_deadline) return 0;
+                if (g.phase !== 'private_chat' && g.phase !== 'public_chat') return 0;
+                return Math.max(0, Math.round(g.phase_deadline - nowMs.value / 1000));
+            });
+
+            // 右栏标签切换（普通对局 / 上帝视角共用）
+            function switchTab(name) {
+                if (watchMode.value) watchTab.value = name;
+                else gameTab.value = name;
+            }
+            // 打开某个私聊会话（会话列表点击）
+            function openPrivateConversation(n) {
+                activePrivateTarget.value = n;
+                if (!privateChats[n]) privateChats[n] = [];
+                gameTab.value = 'private';
+            }
+            // 我的信息（说书人单独发的）：服务端记录 + 本地实时推送合并去重
+            const myNotes = computed(() => {
+                const seen = new Set();
+                const out = [];
+                const push = (v) => {
+                    const k = String(v == null ? '' : v).trim();
+                    if (!k || seen.has(k)) return;
+                    seen.add(k); out.push(k);
+                };
+                (myInfo.value.infos || []).forEach(push);
+                stories.value.forEach(push);
+                return out;
+            });
+            function lastPrivateMsg(n) {
+                const arr = privateChats[n] || [];
+                const m = arr[arr.length - 1];
+                return m ? m.content : '（还没有消息）';
+            }
+            // ——— 我的笔记：只存在本机浏览器（localStorage），不写数据库 ———
+            const myNotesText = ref('');
+            // 剧本资料：角色技能表 + 夜晚顺序（后端 /api/script）
+            const scriptInfo = ref({ roles: [], night_first: [], night_other: [] });
+            let scriptLoaded = false;
+            async function loadScriptInfo() {
+                if (scriptLoaded) return;
+                scriptLoaded = true;
+                try {
+                    const d = await api.get('/api/script');
+                    if (d.data) scriptInfo.value = d.data;
+                } catch (e) { scriptLoaded = false; }
+            }
+            function teamLabel(t) {
+                return ({ townsfolk: '镇民', outsider: '外来者', minion: '爪牙', demon: '恶魔' })[t] || t;
+            }
+            function loadMyNotes() {
+                try { myNotesText.value = localStorage.getItem('botc_notes_' + (roomCode.value || '')) || ''; }
+                catch (e) { myNotesText.value = ''; }
+            }
+            function saveMyNotes() {
+                try { localStorage.setItem('botc_notes_' + (roomCode.value || ''), myNotesText.value); }
+                catch (e) { /* 隐私模式等情况忽略 */ }
+            }
+            const watchActiveSession = ref(null); // 当前查看的私聊会话 key（如 "1-3"）
+            // 私聊会话分组（双向合并为会话，按最新消息排序）
+            const watchSessions = computed(() => {
+                const map = {};
+                for (const pm of watchPrivateMsgs.value) {
+                    const a = Math.min(pm.from_number, pm.to_number);
+                    const b = Math.max(pm.from_number, pm.to_number);
+                    const key = a + '-' + b;
+                    if (!map[key]) map[key] = { key, a, b, msgs: [] };
+                    map[key].msgs.push(pm);
+                }
+                const list = Object.values(map);
+                list.sort((x, y) => y.msgs[y.msgs.length - 1].at - x.msgs[x.msgs.length - 1].at);
+                return list;
+            });
+            const watchActiveMsgs = computed(() => {
+                if (!watchActiveSession.value) return [];
+                const s = watchSessions.value.find(x => x.key === watchActiveSession.value);
+                return s ? s.msgs : [];
+            });
+            function openWatchSession(sess) {
+                watchActiveSession.value = sess ? sess.key : null;
+            }
+            function watchNameOf(n) {
+                const p = sortedPlayers.value.find(x => x.number === n);
+                if (!p) return '#' + n;
+                return '#' + n + ' ' + p.role_name;
+            }
+            // 模板用 computed（Vue 3 编译器不支持 v-for 表达式内嵌三元/括号）
+            const roomPlayers = computed(() => {
+                return (room.value && room.value.players) || [];
+            });
+            // 拖拽换座：拖动卡片到另一个座位 → 交换
+            const dragSeatIdx = ref(-1);
+            const dragOverIdx = ref(-1);
+            function onSeatDragStart(idx) { dragSeatIdx.value = idx; }
+            function onSeatDragEnter(idx) { dragOverIdx.value = idx; }
+            function onSeatDragEnd() { dragSeatIdx.value = -1; dragOverIdx.value = -1; }
+            async function onSeatDrop(idx) {
+                const from = dragSeatIdx.value;
+                dragSeatIdx.value = -1;
+                dragOverIdx.value = -1;
+                if (from < 0 || from === idx) return;
+                const a = roomPlayers.value[from];
+                const b = roomPlayers.value[idx];
+                if (!a || !b) return;
+                try {
+                    await WS.send('room.swap_seat', { room_code: roomCode.value, from: a.seat_number, to: b.seat_number });
+                    toast('已换座', 'success');
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            const activePrivateChats = computed(() => {
+                if (!activePrivateTarget.value) return [];
+                return privateChats[activePrivateTarget.value] || [];
+            });
+            const privateText = ref('');
+            const privatePartners = ref([]);   // 已建立会话的对象编号列表
+            const privateInviteWaiting = ref(null); // 我发出的邀请等待中的对象
+            const privateIncoming = ref(null); // 我收到的邀请 {from_number}
+
+            const isHost = computed(() => room.value && user.value && room.value.host_id === user.value.id);
+            const myReady = computed(() => {
+                if (!room.value || !user.value) return false;
+                const me = room.value.players.find(p => p.user_id === user.value.id);
+                return me ? me.is_ready : false;
+            });
+            const sortedPlayers = computed(() => {
+                if (!game.value || !game.value.players) return [];
+                const list = Object.values(game.value.players);
+                list.sort((a, b) => a.number - b.number);
+                return list;
+            });
+            function nameOf(n) {
+                if (!game.value || !game.value.players) return '';
+                for (const pid in game.value.players) {
+                    const p = game.value.players[pid];
+                    if (p.number === n) return p.is_ai ? (p.ai_model || 'AI 玩家') : p.username;
+                }
+                return '';
+            }
+            // 猎手开枪只走正规渠道（🏹按钮/提名），公聊文本不再做声明检测
+            function isSlayerDecl(m) {
+                return !!(m && m.content && /声称猎手|猎手声明/.test(m.content));
+            }
+            const phaseLabel = computed(() => {
+                const ph = game.value ? game.value.phase : 'waiting';
+                const map = {
+                    waiting: '等待', night: '🌙 夜晚', day: '🌅 黎明',
+                    public_chat: '💬 公聊', private_chat: '🤫 私聊', nomination: '⚖️ 提名',
+                };
+                return map[ph] || ph;
+            });
+            const phaseTagClass = computed(() => {
+                const ph = game.value ? game.value.phase : '';
+                if (ph === 'night') return 'tag';
+                if (ph === 'nomination') return 'tag tag-red';
+                return 'tag tag-yellow';
+            });
+            const aliveCount = computed(() => {
+                if (!game.value || !game.value.players) return 0;
+                return Object.values(game.value.players).filter(p => p.alive).length;
+            });
+            // 公聊发言权：黑夜禁言；辩论期仅提名双方可发言；其余时间可发言
+            const canSpeakNow = computed(() => {
+                if (!game.value) return true;
+                if (game.value.phase === 'night') return false;
+                const av = game.value.active_vote;
+                if (game.value.phase === 'nomination' && av && !av.vote_deadline) {
+                    return myNumber.value === av.from || myNumber.value === av.target;
+                }
+                return true;
+            });
+            // 黑夜消息过滤：黑夜只渲染夜间行动系统卡片，屏蔽普通聊天（消息上下文隔离）
+            const visibleMsgs = computed(() => {
+                if (game.value && game.value.phase === 'night') {
+                    return pubMsgs.value.filter(m => m.nightTip);
+                }
+                return pubMsgs.value;
+            });
+            // 当前待操作的系统卡片（夜晚行动/投票）——显示在聊天区顶部，不混入公聊消息流
+            const activeCard = computed(() => {
+                const msgs = pubMsgs.value || [];
+                for (let i = msgs.length - 1; i >= 0; i--) {
+                    const m = msgs[i];
+                    if (m.nightTip && !m.nightTip.done && !m.nightTip.expired) return m;
+                    if (m.voteCard && !m.voteCard.done) return m;
+                }
+                return null;
+            });
+            const activeCardType = computed(() => {
+                const m = activeCard.value;
+                if (!m) return '';
+                if (m.nightTip) return 'nightTip';
+                if (m.voteCard) return 'voteCard';
+                return '';
+            });
+            const teamName = computed(() => {
+                const t = myInfo.value.my_team;
+                return { townsfolk: '镇民·善良', outsider: '外来者·善良', minion: '爪牙·邪恶', demon: '恶魔·邪恶' }[t] || '?';
+            });
+
+            function toast(msg, type) {
+                ElMessage({ message: msg, type: type || 'info', duration: 2500 });
+            }
+            function scrollMsgs() {
+                requestAnimationFrame(() => {
+                    const el = document.getElementById('game-msgs');
+                    if (el) el.scrollTop = el.scrollHeight;
+                });
+            }
+
+            // ——— 认证（HTTP） ———
+            const captchaCode = ref('');
+            async function refreshCaptcha() {
+                try {
+                    const d = await api.get('/api/captcha');
+                    captchaCode.value = d.data.captcha;
+                    drawCaptcha(d.data.captcha);
+                } catch (e) { /* 忽略 */ }
+            }
+            function drawCaptcha(code) {
+                const cv = document.getElementById('captchaCanvas');
+                if (!cv) return;
+                const ctx = cv.getContext('2d');
+                ctx.fillStyle = '#101013';
+                ctx.fillRect(0, 0, cv.width, cv.height);
+                for (let i = 0; i < 6; i++) {
+                    ctx.strokeStyle = 'rgba(' + (120 + Math.random() * 120) + ',' + (120 + Math.random() * 120) + ',' + (150 + Math.random() * 100) + ',0.6)';
+                    ctx.beginPath();
+                    ctx.moveTo(Math.random() * cv.width, Math.random() * cv.height);
+                    ctx.lineTo(Math.random() * cv.width, Math.random() * cv.height);
+                    ctx.stroke();
+                }
+                for (let i = 0; i < 4; i++) {
+                    ctx.save();
+                    ctx.font = 'bold 22px monospace';
+                    ctx.fillStyle = ['#a5aef0', '#e8b23c', '#7ecb9c', '#ee9aa4'][i];
+                    ctx.translate(16 + i * 24, 26 + Math.random() * 6 - 3);
+                    ctx.rotate((Math.random() - 0.5) * 0.5);
+                    ctx.fillText(code[i] || '', 0, 0);
+                    ctx.restore();
+                }
+            }
+            async function doLogin() {
+                if (busy.value) return;
+                busy.value = true;
+                try {
+                    const url = isRegister.value ? '/api/auth/register' : '/api/auth/login';
+                    const d = await api.post(url, {
+                        username: loginForm.username.trim(), password: loginForm.password,
+                        captcha: loginForm.captcha.trim(), email: loginForm.email.trim(), phone: loginForm.phone.trim(),
+                    });
+                    await fetchMe();
+                    view.value = 'lobby';
+                    WS.connect();
+                    toast(isRegister.value ? '注册成功' : '欢迎回来', 'success');
+                } catch (e) {
+                    toast(e.message, 'error');
+                    refreshCaptcha();
+                    loginForm.captcha = '';
+                } finally {
+                    busy.value = false;
+                }
+            }
+            async function fetchMe() {
+                try {
+                    const d = await api.get('/api/me');
+                    user.value = d.data.user;
+                } catch (e) { /* 忽略 */ }
+            }
+            async function doLogout() {
+                await api.post('/api/auth/logout').catch(() => {});
+                try { WS.disconnect(); } catch (e) { /* 忽略 */ }
+                sessionStorage.removeItem('botc_room');
+                view.value = 'login';
+                user.value = null;
+                refreshCaptcha();
+            }
+
+            // ——— 大厅（HTTP 建房 + WS 加入） ———
+            async function createRoom() {
+                if (busy.value) return;
+                busy.value = true;
+                try {
+                    const d = await api.post('/api/room/create');
+                    enterRoom(d.data.room.room_code);
+                } catch (e) { toast(e.message, 'error'); } finally { busy.value = false; }
+            }
+            // 电子斗蛐蛐：观战房间（房主不占座位，纯 AI 对局上帝视角）
+            async function createArena() {
+                if (busy.value) return;
+                busy.value = true;
+                try {
+                    const d = await api.post('/api/arena/create');
+                    enterRoom(d.data.room.room_code);
+                } catch (e) { toast(e.message, 'error'); } finally { busy.value = false; }
+            }
+            async function joinRoomByCode() {
+                if (!joinCode.value || busy.value) return;
+                busy.value = true;
+                const code = joinCode.value.toUpperCase();
+                try {
+                    await enterRoom(code);
+                } catch (e) {
+                    roomCode.value = '';
+                    view.value = 'lobby';
+                } finally { busy.value = false; }
+            }
+
+            // ——— 房间（WS 指令 + 事件） ———
+            function ensureWS() {
+                return new Promise((resolve, reject) => {
+                    if (WS.conn && WS.conn.readyState === WebSocket.OPEN) { resolve(); return; }
+                    const timer = setTimeout(() => { off(); reject(new Error('连接服务器超时')); }, 8000);
+                    const off = WS.on('_open', () => { clearTimeout(timer); off(); resolve(); });
+                });
+            }
+            async function enterRoom(code) {
+                roomCode.value = code;
+                room.value = null;
+                roomMessages.value = [];
+                view.value = 'room';
+                try {
+                    await ensureWS();
+                    const ack = await joinRoomWS();
+                    applyRoomState(ack.state);
+                    sessionStorage.setItem('botc_room', code);
+                } catch (e) {
+                    toast(e.message, 'error');
+                    throw e;
+                }
+            }
+            async function joinRoomWS() {
+                const ack = await WS.send('room.join', { room_code: roomCode.value });
+                applyRoomState(ack.state);
+                if (ack.watch_mode) {
+                    watchMode.value = true;
+                    // 历史私聊字段名兼容：归档 JSON 用 from/to，实时事件用 from_number/to_number
+                    watchPrivateMsgs.value = (ack.private_msgs || []).map(normPM);
+                    watchStories.value = filterStories(ack.stories);
+                } else {
+                    watchMode.value = false;
+                    watchPrivateMsgs.value = [];
+                    watchStories.value = [];
+                }
+                return ack;
+            }
+            // 私聊消息字段规范化：统一为 from_number/to_number（缺失时从 from/to 兼容读取）
+            function normPM(m) {
+                if (m.from_number == null && m.from != null) m.from_number = m.from;
+                if (m.to_number == null && m.to != null) m.to_number = m.to;
+                return m;
+            }
+            // 上帝视角记录过滤：身份发放/角色能力说明/天亮播报不属于"事件"，不进记录
+            const BAD_STORY = /你的身份是|你的角色|天亮了|天天亮|如果你在|每个夜晚|每局游戏|当你首次|如果恶魔死亡|你会得知|你醒来后|你的恶魔编号|你的爪牙编号|不在场的镇民|如果你被处决|如果只有三名|你的阵营获胜|善良阵营落败/;
+            function filterStories(raw) {
+                const arr = [];
+                const seen = new Set();
+                // 后端现在返回有序数组 storyLog；兼容旧的 map 结构
+                let items = [];
+                if (Array.isArray(raw)) {
+                    items = raw;
+                } else if (raw && typeof raw === 'object') {
+                    Object.keys(raw).forEach(k => {
+                        (raw[k] || []).forEach(function(item){
+                            items.push((typeof item === 'string') ? { number: k, day: 0, content: item } : Object.assign({ number: k }, item));
+                        });
+                    });
+                }
+                items.forEach(function(item){
+                    const obj = (typeof item === 'string') ? { day: 0, content: item } : item;
+                    if (BAD_STORY.test(obj.content || '')) return;
+                    var key = (obj.day || 0) + '|' + obj.content;
+                    if (seen.has(key)) return;
+                    seen.add(key);
+                    arr.push({ number: obj.number, day: obj.day || 0, content: obj.content, ts: obj.ts || 0 });
+                });
+                arr.sort(function(a, b){ return (a.ts || 0) - (b.ts || 0); });
+                return arr;
+            }
+            function applyRoomState(snap) {
+                if (!snap) return;
+                room.value = snap.room;
+                roomMessages.value = snap.messages || [];
+                seatCount.value = snap.room.max_players;
+            }
+            async function sendRoomMsg() {
+                const txt = chatText.value.trim();
+                if (!txt) return;
+                chatText.value = '';
+                try {
+                    await WS.send('room.chat', { room_code: roomCode.value, content: txt });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function toggleReady() {
+                try {
+                    await WS.send('room.ready', { room_code: roomCode.value });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function addAI(type) {
+                try {
+                    await WS.send('room.add_ai', { room_code: roomCode.value, ai_type: type });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            // 大模型 AI 弹窗：手动输入 API 配置（服务商预设 + 自定义）
+            const llmDialog = ref(false);
+            const llmPresets = [
+                { key: 'deepseek', label: 'DeepSeek（官方）', base_url: 'https://api.deepseek.com', model: 'deepseek-chat', needKey: true,
+                  models: ['deepseek-chat', 'deepseek-reasoner'] },
+                { key: 'siliconflow', label: '硅基流动（有免费额度）', base_url: 'https://api.siliconflow.cn/v1', model: 'Qwen/Qwen2.5-7B-Instruct', needKey: true,
+                  models: ['Qwen/Qwen2.5-7B-Instruct', 'Qwen/Qwen2.5-14B-Instruct', 'Qwen/Qwen2.5-32B-Instruct', 'Qwen/Qwen2.5-72B-Instruct', 'Qwen/Qwen3-30B-A3B', 'Qwen/Qwen3-32B', 'deepseek-ai/DeepSeek-V3', 'deepseek-ai/DeepSeek-R1', 'THUDM/glm-4-9b-chat'] },
+                { key: 'zhipu', label: '智谱 GLM', base_url: 'https://open.bigmodel.cn/api/paas/v4', model: 'glm-4-flash', needKey: true,
+                  models: ['glm-4-flash', 'glm-4-flash-250414', 'glm-4-air', 'glm-4-air-250414', 'glm-4-plus', 'glm-4.5', 'glm-4.6'] },
+                { key: 'moonshot', label: '月之暗面 Kimi', base_url: 'https://api.moonshot.cn/v1', model: 'kimi-k2.6', needKey: true,
+                  models: ['kimi-k2.6', 'kimi-k2.7-code', 'kimi-latest', 'moonshot-v1-8k'] },
+                { key: 'dashscope', label: '阿里通义（百炼）', base_url: 'https://dashscope.aliyuncs.com/compatible-mode/v1', model: 'qwen-turbo', needKey: true,
+                  models: ['qwen-turbo', 'qwen-plus', 'qwen-max', 'qwen-flash', 'qwen-long'] },
+                { key: 'hunyuan', label: '腾讯混元', base_url: 'https://api.hunyuan.cloud.tencent.com/v1', model: 'hunyuan-lite', needKey: true,
+                  models: ['hunyuan-lite', 'hunyuan-turbo', 'hunyuan-pro', 'hunyuan-standard'] },
+                { key: 'groq', label: 'Groq（高速免费额度）', base_url: 'https://api.groq.com/openai/v1', model: 'llama-3.3-70b-versatile', needKey: true,
+                  models: ['llama-3.3-70b-versatile', 'llama-3.1-8b-instant', 'deepseek-r1-distill-llama-70b', 'qwen-qwq-32b'] },
+                { key: 'openrouter', label: 'OpenRouter（有免费模型）', base_url: 'https://openrouter.ai/api/v1', model: 'deepseek/deepseek-chat-v3-0324:free', needKey: true,
+                  models: ['deepseek/deepseek-chat-v3-0324:free', 'deepseek/deepseek-r1:free', 'meta-llama/llama-3.3-70b-instruct:free', 'qwen/qwen-2.5-72b-instruct'] },
+                { key: 'ollama', label: 'Ollama 本地（免费离线）', base_url: 'http://127.0.0.1:11434/v1', model: 'qwen2.5:7b', needKey: false,
+                  models: ['qwen2.5:7b', 'qwen2.5:14b', 'llama3.1:8b', 'deepseek-r1:7b'] },
+            ];
+            const llmForm = reactive({ provider: 'deepseek', api_key: '', base_url: '', model: '' });
+            const llmModelOptions = computed(() => {
+                const pr = llmPresets.find(p => p.key === llmForm.provider);
+                return (pr && pr.models) || [];
+            });
+            const usage = ref(null);
+            const roomUsage = computed(() => {
+                if (!usage.value || !usage.value.rooms) return null;
+                return usage.value.rooms[roomCode.value] || null;
+            });
+            function fmtTokens(n) {
+                n = Number(n) || 0;
+                if (n >= 1000000) return (n / 1000000).toFixed(1) + 'M';
+                if (n >= 1000) return (n / 1000).toFixed(1) + 'K';
+                return String(n);
+            }
+            async function fetchUsage() {
+                try {
+                    const r = await api.get('/api/ai_usage');
+                    usage.value = r.data;
+                } catch (e) { usage.value = null; }
+            }
+            function openLlmDialog() {
+                pickLlmPreset('deepseek');
+                llmDialog.value = true;
+                fetchUsage();
+            }
+            function pickLlmPreset(key) {
+                const pr = llmPresets.find(p => p.key === key);
+                if (!pr) return;
+                llmForm.provider = key;
+                llmForm.base_url = pr.base_url;
+                llmForm.model = pr.model;
+                if (!pr.needKey) llmForm.api_key = '';
+                pingResult.value = '';
+            }
+            const llmBusy = ref(false);
+            const pingResult = ref('');
+            async function pingLlm() {
+                if (!llmForm.api_key && llmForm.provider !== 'ollama') {
+                    toast('请先填写 API Key（或选择 Ollama 本地模型）', 'error');
+                    return;
+                }
+                pingResult.value = '测试中…';
+                try {
+                    const ping = await api.post('/api/llm_ping', {
+                        llm_conf: JSON.stringify({
+                            api_key: llmForm.api_key,
+                            base_url: llmForm.base_url,
+                            model: llmForm.model,
+                        }),
+                    });
+                    if (!ping.data.ok) {
+                        pingResult.value = '<span style="color:#ee9aa4;">❌ ' + (ping.data.error || '未知错误') + '</span>';
+                        return;
+                    }
+                    pingResult.value = '<span style="color:#7ecb9c;">✅ 连通正常（' + (ping.data.model || '') + '）</span>';
+                } catch (e) {
+                    pingResult.value = '<span style="color:#ee9aa4;">❌ AI 服务不可用：' + e.message + '</span>';
+                }
+            }
+            async function confirmAddLlmAI() {
+                if (!llmForm.api_key && llmForm.provider !== 'ollama') {
+                    toast('请填写 API Key（或选择 Ollama 本地模型）', 'error');
+                    return;
+                }
+                llmBusy.value = true;
+                // 先测试连通性：Key/端点不可用立即提示，避免添加后 AI 一直沉默
+                try {
+                    const ping = await api.post('/api/llm_ping', {
+                        llm_conf: JSON.stringify({
+                            api_key: llmForm.api_key,
+                            base_url: llmForm.base_url,
+                            model: llmForm.model,
+                        }),
+                    });
+                    if (!ping.data.ok) {
+                        pingResult.value = '<span style="color:#ee9aa4;">❌ ' + (ping.data.error || '未知错误') + '</span>';
+                        return;
+                    }
+                    pingResult.value = '<span style="color:#7ecb9c;">✅ 连通正常（' + (ping.data.model || '') + '）</span>';
+                } catch (e) {
+                    pingResult.value = '<span style="color:#ee9aa4;">❌ AI 服务不可用：' + e.message + '</span>';
+                    return;
+                } finally {
+                    llmBusy.value = false;
+                }
+                llmBusy.value = true;
+                try {
+                    await WS.send('room.add_ai', {
+                        room_code: roomCode.value,
+                        ai_type: 'api',
+                        api_key: llmForm.api_key,
+                        base_url: llmForm.base_url,
+                        model: llmForm.model,
+                    });
+                    toast('已添加 ' + (llmForm.model || 'AI') + ' 玩家，可以继续添加下一个（面板不会关闭）', 'success');
+                    llmForm.api_key = '';
+                    pingResult.value = '';
+                    fetchUsage();
+                } catch (e) { toast(e.message, 'error'); } finally { llmBusy.value = false; }
+            }
+            // 一键入座 8 智谱 AI 已移除（Key 外置方案废弃）；添加 AI 走上方单座添加
+            const roomAIList = computed(() => {
+                if (!room.value || !room.value.players) return [];
+                return room.value.players.filter(p => p.is_ai);
+            });
+            const humanList = computed(() => {
+                if (!room.value || !room.value.players) return [];
+                return room.value.players.filter(p => !p.is_ai && p.user_id !== room.value.host_id);
+            });
+            async function removeAI(seat) {
+                try {
+                    await WS.send('room.remove_ai', { room_code: roomCode.value, seat });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            // 房主踢出真人玩家（仅等待房间）
+            async function kickPlayer(userId) {
+                try {
+                    await WS.send('room.kick', { room_code: roomCode.value, user_id: userId });
+                    toast('已将该玩家移出房间', 'success');
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function setSeats() {
+                try {
+                    await WS.send('room.set_seats', { room_code: roomCode.value, max_players: seatCount.value });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function startGame() {
+                if (busy.value) return;
+                busy.value = true;
+                try {
+                    await WS.send('room.start', { room_code: roomCode.value });
+                } catch (e) { toast(e.message, 'error'); } finally { busy.value = false; }
+            }
+            async function leaveRoom() {
+                leaveGameView();
+                try {
+                    await WS.send('room.leave', { room_code: roomCode.value });
+                } catch (e) { /* 忽略 */ }
+                sessionStorage.removeItem('botc_room');
+                view.value = 'lobby';
+                room.value = null;
+            }
+            // 复制房间邀请链接（房码直链，好友打开后自动填入房码）
+            async function copyRoomLink() {
+                const url = location.origin + location.pathname + '#join=' + roomCode.value;
+                try {
+                    await navigator.clipboard.writeText(url);
+                    toast('邀请链接已复制：' + url, 'success');
+                } catch (e) {
+                    toast('房间码 ' + roomCode.value + '（请手动告知好友）', 'info');
+                }
+            }
+
+            // ——— 游戏（WS 指令 + 事件） ———
+            function enterGame() {
+                game.value = null;
+                pubMsgs.value = [];
+                stories.value = [];
+                myInfo.value = { infos: [], my_role: '?', my_team: '?' };
+                overDialog.value = false;
+                nightInfo.value = null;
+                enterGameState();
+            }
+            function enterGameState() {
+                view.value = 'game';
+                loadMyInfo();
+                loadMyNotes();
+                loadScriptInfo();
+                startChoicePoll();
+            }
+            function leaveGameView() {
+                stopChoicePoll();
+            }
+            // 轮询兜底（双通道）：3 秒查一次挂起选择，WS 事件/WS 查询/HTTP 查询任一可用都能弹面板
+            let choicePollTimer = null;
+            function startChoicePoll() {
+                stopChoicePoll();
+                const check = async () => {
+                    if (view.value !== 'game' || !roomCode.value) return;
+                    let pc = null;
+                    let myN = myNumber.value;
+                    // 通道 1：WS 查询
+                    try {
+                        const ack = await WS.send('game.my_info', { room_code: roomCode.value });
+                        pc = ack.pending_choice;
+                        if (ack.my_number) myN = ack.my_number;
+                    } catch (e) { /* WS 不可用，走 HTTP */ }
+                    // 通道 2：HTTP 查询（与 WS 完全独立）
+                    if (!pc) {
+                        try {
+                            const d = await api.get('/api/game/' + roomCode.value + '/pending');
+                            pc = d.data.pending_choice;
+                            if (d.data.my_number) myN = d.data.my_number;
+                        } catch (e) { /* 忽略 */ }
+                    }
+                    if (pc && myN && pc.number === myN) {
+                        addNightTip({
+                            number: pc.number, role: pc.role, role_name: pc.role_name,
+                            valid_targets: pc.valid_targets || [],
+                            max_targets: pc.max_targets || 2,
+                            deadline: pc.deadline,
+                            tip_id: pc.tip_id,
+                        });
+                    }
+                };
+                check();
+                choicePollTimer = setInterval(check, 3000);
+            }
+            function stopChoicePoll() {
+                if (choicePollTimer) { clearInterval(choicePollTimer); choicePollTimer = null; }
+            }
+            // 猎手开枪（真人玩家）：右上角弓箭图标 → 选目标 → 系统判定
+            const slayerDialog = ref(false);
+            const slayerTarget = ref(null);
+            const mySlayerUsable = computed(() => {
+                if (myInfo.value.my_role !== '猎手') return false;
+                if (!game.value || !game.value.players) return false;
+                const me = Object.values(game.value.players).find(p => p.number === myNumber.value);
+                if (!me) return false;
+                return me.alive && !me.slayer_used;
+            });
+            function openSlayerDialog() {
+                slayerTarget.value = null;
+                slayerDialog.value = true;
+            }
+            async function confirmSlayerShoot() {
+                if (!slayerTarget.value) { toast('请选择一个目标', 'error'); return; }
+                try {
+                    await WS.send('game.slayer_shoot', { room_code: roomCode.value, target_number: slayerTarget.value });
+                    slayerDialog.value = false;
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function loadMyInfo() {
+                try {
+                    const ack = await WS.send('game.my_info', { room_code: roomCode.value });
+                    myInfo.value = {
+                        infos: ack.infos || [],
+                        my_role: ack.my_role || '?',
+                        my_team: ack.my_team || '?',
+                        my_number: ack.my_number || myNumber.value,
+                    };
+                    if (ack.my_number) myNumber.value = ack.my_number;
+                } catch (e) { /* 忽略 */ }
+            }
+            function applyGameState(snap) {
+                if (!snap || !snap.game) return;
+                game.value = snap.game;
+                // 消息合并：只追加新消息，绝不整表替换（否则会丢掉 AI 历史发言，只剩系统消息）
+                const old = pubMsgs.value;
+                const incoming = snap.messages || [];
+                if (!old.length) {
+                    pubMsgs.value = incoming.slice(-500);
+                } else {
+                    const exist = new Set(old.map(m => m.id).filter(v => v != null));
+                    const fresh = incoming.filter(m => m.id != null && !exist.has(m.id));
+                    if (fresh.length) {
+                        pubMsgs.value = [...old, ...fresh].slice(-500);
+                    }
+                    // 注意：incoming 比 old 少时也不替换——后端快照可能只含部分消息，
+                    // 整表替换会导致 AI 发言消失（历史 bug：投票开始时屏幕只剩系统消息）
+                }
+                const me = Object.values(snap.game.players).find(p => p.user_id === user.value.id);
+                if (me) myNumber.value = me.number;
+                // 断线重连恢复：按相位恢复聊天状态
+                const ph = snap.game.phase;
+                if (ph === 'private_chat' && !privatePhase.value) {
+                    enterPrivatePhase();
+                } else if (ph !== 'private_chat' && privatePhase.value) {
+                    leavePrivatePhase();
+                }
+                // 断线重连恢复：挂起的真人行动 → 公聊消息流恢复定向提示（不弹面板）
+                const pc = snap.game.pending_choice;
+                if (pc && myNumber.value && pc.number === myNumber.value) {
+                    addNightTip({
+                        number: pc.number, role: pc.role, role_name: pc.role_name,
+                        valid_targets: pc.valid_targets || [],
+                        max_targets: pc.max_targets || 2,
+                        deadline: pc.deadline,
+                        tip_id: pc.tip_id,
+                    });
+                }
+                // 注意：不再在前端自行判定"挂起已解除→置过期"；
+                // 卡片状态只由服务端事件驱动（提交 ack / 超时 phase 事件带 tip_id → markTipDone）
+            }
+            async function sendGameMsg() {
+                // 私聊标签页中的对话：消息走一对一私聊通道，不进公聊
+                if (!watchMode.value && gameTab.value === 'private' && activePrivateTarget.value) {
+                    const txt = gameChatText.value.trim();
+                    if (!txt) return;
+                    gameChatText.value = '';
+                    try {
+                        await WS.send('game.private_chat', { room_code: roomCode.value, to_number: activePrivateTarget.value, content: txt });
+                    } catch (e) { toast(e.message, 'error'); }
+                    return;
+                }
+                const txt = gameChatText.value.trim();
+                if (!txt) return;
+                atMenuVisible.value = false;
+                // 挂起中：纯数字序列（如"2 5"）→ 解析为夜晚行动选择提交
+                const activeTip = pubMsgs.value.find(m => m.nightTip && m.nightTip.active);
+                if (activeTip) {
+                    const nums = tryParseChoiceInput(txt);
+                    if (nums) {
+                        gameChatText.value = '';
+                        activeTip.nightTip.selected = [...nums];
+                        await submitTipChoice(activeTip);
+                        return;
+                    }
+                }
+                gameChatText.value = '';
+                try {
+                    await WS.send('game.chat', { room_code: roomCode.value, content: txt });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function nextPhase() {
+                try {
+                    const ack = await WS.send('game.next_phase', { room_code: roomCode.value });
+                    applyPhaseResult(ack);
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            function applyPhaseResult(d) {
+                // 面板只由「提交成功」和「倒计时归零」关闭，中间广播一律不得关闭
+                // （超时兜底广播 phase=night 时倒计时 tick 会自行关闭面板）
+                if (d.game_over) {
+                    winner.value = d.winner;
+                    overDialog.value = true;
+                }
+                // 夜晚行动进度条只在电子斗蛐蛐（纯 AI 观战）显示；真人对局会暴露角色，一律不记录
+                if (!watchMode.value) {
+                    nightInfo.value = null;
+                } else if (d.role_name) {
+                    nightInfo.value = { role_name: d.role_name, step: d.step, total: d.total };
+                } else if (d.phase !== 'night') {
+                    nightInfo.value = null;
+                }
+                // 私聊阶段：进入/退出控制
+                if (d.phase === 'private_chat') {
+                    enterPrivatePhase();
+                } else if (d.phase !== 'private_chat' && privatePhase.value) {
+                    leavePrivatePhase();
+                }
+                // 夜晚行动提交/超时事件：更新对应卡片状态（不新增消息）
+                if (d.tip_id) {
+                    markTipDone(d);
+                }
+            }
+            // 夜间行动定向提示（仅自己可见）：在公聊消息流内渲染选择按钮，不再弹独立面板
+            let tipSeq = 0;
+            function addNightTip(d) {
+                // 后端必须下发唯一 tip_id（取自 pending_choice 唯一标识）；缺失则报错并放弃渲染
+                if (!d.tip_id) {
+                    console.error('[night_tip] 缺少 tip_id，放弃渲染卡片:', d);
+                    return;
+                }
+                // 幂等去重：消息根层级 tip_id 相同 → 只渲染一次（提交/超时后永久拦截）
+                if (pubMsgs.value.some(m => m.tip_id === d.tip_id)) return;
+                // 超时以"卡片送达时刻"为起点：deadline 已过期时重新给 45 秒操作窗口（秒级整数时间戳）
+                const now = Math.floor(Date.now() / 1000);
+                const rawDeadline = Math.floor(d.deadline || 0);
+                const deadline = rawDeadline > now ? rawDeadline : now + 180;
+                pubMsgs.value.push({
+                    id: 'tip' + (++tipSeq),
+                    tip_id: d.tip_id, // 去重标识挂在消息根层级
+                    number: 0, system: true,
+                    content: '🔮 夜晚行动：' + (d.role_name || '角色') + ' 请选择 ' + (d.max_targets || 2) + ' 名目标',
+                    nightTip: {
+                        role: d.role, role_name: d.role_name, skill: d.skill || '',
+                        targets: d.valid_targets || d.targets || [],
+                        max_targets: d.max_targets || 2,
+                        deadline,
+                        selected: [], done: false, expired: false, active: true,
+                        left: Math.max(0, deadline - now),
+                    },
+                });
+                // TODO(并行行动): 当前夜晚角色串行执行，全局 tipCountdownTimer 暂时可用；
+                // 未来支持并行角色行动时，必须改为每个 tip 卡片持有独立定时器，禁止共用全局 tipCountdownTimer。
+                console.log('[tip-debug] addNightTip push tip_id=' + d.tip_id + ' deadline=' + deadline + ' now=' + now + ' left=' + Math.max(0, deadline - now));
+                // 倒计时仅用于展示：归零不置 expired（与投票卡片一致，状态只由服务端事件驱动）
+                if (tipCountdownTimer) clearInterval(tipCountdownTimer);
+                const tick = () => {
+                    let anyActive = false;
+                    for (const m of pubMsgs.value) {
+                        const t = m.nightTip;
+                        if (!t || !t.active) continue;
+                        anyActive = true;
+                        t.left = Math.max(0, Math.floor(t.deadline - Date.now() / 1000));
+                    }
+                    if (!anyActive) clearInterval(tipCountdownTimer);
+                };
+                tick();
+                tipCountdownTimer = setInterval(tick, 500);
+            }
+            // 收到后端 tip_id 对应的提交/超时事件 → 更新已有卡片状态（不新增消息）
+            function markTipDone(d) {
+                if (!d.tip_id) return;
+                for (const m of pubMsgs.value) {
+                    if (m.tip_id === d.tip_id && m.nightTip) {
+                        console.log('[tip-debug] markTipDone tip_id=' + d.tip_id + ' timeout=' + (d.timeout || false));
+                        m.nightTip.active = false;
+                        if (d.timeout) m.nightTip.expired = true;
+                        else m.nightTip.done = true;
+                    }
+                }
+            }
+            function toggleTipTarget(m, n) {
+                const t = m.nightTip;
+                const idx = t.selected.indexOf(n);
+                if (idx >= 0) { t.selected.splice(idx, 1); return; }
+                if (t.selected.length >= t.max_targets) {
+                    toast('最多选择 ' + t.max_targets + ' 名玩家', 'info');
+                    return;
+                }
+                t.selected.push(n);
+            }
+            async function submitTipChoice(m) {
+                const t = m.nightTip;
+                if (t.done || t.expired || t.selected.length !== t.max_targets) {
+                    toast('还需选择 ' + (t.max_targets - t.selected.length) + ' 名目标才能确认', 'info');
+                    return;
+                }
+                try {
+                    await WS.send('game.submit_choice', { room_code: roomCode.value, targets: [...t.selected] });
+                    t.done = true;
+                    t.active = false;
+                    toast('已提交选择，等待夜晚继续…', 'success');
+                } catch (e) {
+                    // 挂起已解除（超时代选/重复提交）
+                    t.expired = true;
+                    t.active = false;
+                    toast(e.message, 'error');
+                }
+            }
+            // 输入框数字提交：挂起中发送纯数字序列（如"2 5"）→ 解析为目标提交
+            function tryParseChoiceInput(txt) {
+                const parts = txt.trim().split(/\s+/).map(s => parseInt(s, 10));
+                if (parts.length && parts.every(n => !isNaN(n) && n > 0)) return parts;
+                return null;
+            }
+            // 座位标注（仅自己可见）：猜测角色 / 阵营 / 态度
+            const guessLabels = ref({});
+            const guessMenuFor = ref(null);
+            const ALL_ROLES = [
+                { key: 'washerwoman', name: '洗衣妇' }, { key: 'librarian', name: '图书管理员' },
+                { key: 'investigator', name: '调查员' }, { key: 'chef', name: '厨师' },
+                { key: 'empath', name: '共情者' }, { key: 'fortune_teller', name: '占卜师' },
+                { key: 'undertaker', name: '送葬者' }, { key: 'monk', name: '僧侣' },
+                { key: 'ravenkeeper', name: '守鸦人' }, { key: 'virgin', name: '贞洁者' },
+                { key: 'slayer', name: '猎手' }, { key: 'soldier', name: '士兵' },
+                { key: 'mayor', name: '镇长' }, { key: 'butler', name: '管家' },
+                { key: 'drunk', name: '酒鬼' }, { key: 'recluse', name: '陌客' },
+                { key: 'saint', name: '圣徒' }, { key: 'poisoner', name: '投毒者' },
+                { key: 'spy', name: '间谍' }, { key: 'scarlet_woman', name: '红唇女郎' },
+                { key: 'baron', name: '男爵' }, { key: 'imp', name: '小恶魔' },
+            ];
+            function roleIcon(key) {
+                if (!key) return '';
+                const alias = { fortune_teller: 'fortuneteller', scarlet_woman: 'scarletwoman' };
+                return '/static/assets/roles/' + (alias[key] || key) + '.svg';
+            }
+            // 夜晚顺序里的流程步骤（爪牙信息/恶魔信息/互认）没有角色图标
+            function hasRoleIcon(key) {
+                return ['minion_info', 'demon_info', 'demon_minion_meet'].indexOf(key) < 0;
+            }
+            // 提名事件文本拆分：头部（谁提名谁）+ 理由
+            function nominateHead(c) {
+                return String(c || '').replace(/^📢\s*/, '').split('｜理由：')[0];
+            }
+            function nominateReason(c) {
+                const parts = String(c || '').split('｜理由：');
+                return parts.length > 1 ? parts.slice(1).join('｜理由：') : '';
+            }
+            function openGuessMenu(p) {
+                guessMenuFor.value = p;
+            }
+            function markOf(n) {
+                return guessLabels.value[n] || { role: '', team: '', susp: '' };
+            }
+            function setMark(field, value) {
+                const p = guessMenuFor.value;
+                if (!p) return;
+                const cur = { role: '', team: '', susp: '', ...(guessLabels.value[p.number] || {}) };
+                cur[field] = (cur[field] === value) ? '' : value;
+                const copy = { ...guessLabels.value };
+                if (!cur.role && !cur.team && !cur.susp) delete copy[p.number];
+                else copy[p.number] = cur;
+                guessLabels.value = copy;
+                guessMenuFor.value = null;
+            }
+            function clearMark() {
+                const p = guessMenuFor.value;
+                if (!p) return;
+                const copy = { ...guessLabels.value };
+                delete copy[p.number];
+                guessLabels.value = copy;
+                guessMenuFor.value = null;
+            }
+            function clickPlayer(p) {
+                if (watchMode.value) return; // 上帝视角观战：座位只展示，不发起私聊/提名
+                const ph = game.value && game.value.phase;
+                if (ph === 'night') return; // 夜晚不得私聊/操作
+                if (!p.alive && ph !== 'private_chat') { toast('该玩家已死亡', 'info'); return; }
+                if (p.number === myNumber.value) return;
+                if (ph === 'private_chat') {
+                    // 已建立会话 → 直接进入私聊模式；否则发起邀请
+                    if (privatePartners.value.includes(p.number)) {
+                        openPrivateConversation(p.number);
+                    } else {
+                        invitePrivate(p.number);
+                    }
+                    return;
+                }
+                if (ph === 'nomination') { nominate(p.number); return; }
+                // 公聊/白天：左键不再打开标注；右键座位编辑标注
+                toast('当前阶段不可操作', 'info');
+            }
+            async function nominate(num) {
+                try {
+                    await WS.send('game.nominate', { room_code: roomCode.value, target_number: num });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function endGame() {
+                try {
+                    await WS.send('game.end', { room_code: roomCode.value });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            // ——— 提名投票 ———
+            async function castVote(choice) {
+                const card = pubMsgs.value.find(m => m.voteCard && !m.voteCard.done);
+                if (!card) { toast('当前没有进行中的投票', 'info'); return; }
+                try {
+                    const ack = await WS.send('game.vote', { room_code: roomCode.value, choice });
+                    // 倒计时内可反复切换意向：更新本地卡片的投票状态
+                    card.voteCard.mine = ack.choice === 'yes';
+                    if (ack.choice === 'yes') toast('已投票，倒计时结束前可取消', 'success');
+                    else toast('已取消投票', 'info');
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function endNomination() {
+                try {
+                    await WS.send('game.end_nomination', { room_code: roomCode.value });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            // ——— 私聊 ———
+            function enterPrivatePhase() {
+                privatePhase.value = true;
+                privatePanelVisible.value = true;
+                gameTab.value = 'private';
+                for (const k in privateChats) delete privateChats[k];
+                privateTarget.value = null;
+                privateText.value = '';
+                privatePartners.value = [];
+                privateInviteWaiting.value = null;
+                privateIncoming.value = null;
+            }
+            function leavePrivatePhase() {
+                // 完全离开私聊阶段（相位切换时由 applyPhaseResult 调用）
+                privatePhase.value = false;
+                privatePanelVisible.value = false;
+                privateIncoming.value = null;
+                privateInviteWaiting.value = null;
+                activePrivateTarget.value = null;
+                gameTab.value = 'public';
+            }
+            // 收起私聊面板：阶段计时继续，顶部标签可重新打开
+            function collapsePrivatePanel() {
+                privatePanelVisible.value = false;
+            }
+            function openPrivatePanel() {
+                privatePanelVisible.value = true;
+            }
+            function pickPrivateTarget(n) {
+                privateTarget.value = n;
+                if (!privateChats[n]) privateChats[n] = [];
+            }
+            // 找人私聊：发起邀请
+            async function invitePrivate(n) {
+                try {
+                    const ack = await WS.send('game.private_invite', { room_code: roomCode.value, to_number: n });
+                    if (ack.auto_accept) {
+                        // AI 自动接受
+                        privatePartners.value = [...new Set([...privatePartners.value, ack.partner])];
+                        privateTarget.value = ack.partner;
+                        if (!privateChats[ack.partner]) privateChats[ack.partner] = [];
+                        openPrivateConversation(ack.partner);
+                        toast('# ' + ack.partner + ' 接受了你的私聊邀请', 'success');
+                    } else {
+                        privateInviteWaiting.value = ack.partner;
+                        toast('已向 #' + ack.partner + ' 发出私聊邀请，等待接受…', 'info');
+                    }
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            // 被邀请私聊：接受 → 直接进入私聊模式
+            async function acceptPrivate() {
+                if (!privateIncoming.value) return;
+                const from = privateIncoming.value.from_number;
+                try {
+                    await WS.send('game.private_accept', { room_code: roomCode.value });
+                    privateIncoming.value = null;
+                    privatePartners.value = [...new Set([...privatePartners.value, from])];
+                    privateTarget.value = from;
+                    if (!privateChats[from]) privateChats[from] = [];
+                    activePrivateTarget.value = from; // 聊天面板切换为私聊对话
+                    gameTab.value = 'private';
+                    toast('你已接受 #' + from + ' 的私聊', 'success');
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            // 退出当前私聊对话：只回到会话列表（不结束服务端会话，随时可以再点开）
+            function exitPrivateChat() {
+                activePrivateTarget.value = null;
+            }
+            // 被邀请私聊：拒绝
+            async function declinePrivate() {
+                if (!privateIncoming.value) return;
+                try {
+                    await WS.send('game.private_decline', { room_code: roomCode.value });
+                    privateIncoming.value = null;
+                    toast('已拒绝私聊邀请', 'info');
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function sendPrivateMsg() {
+                const txt = privateText.value.trim();
+                if (!txt || !privateTarget.value) return;
+                const to = privateTarget.value;
+                try {
+                    // 只发送 WS：消息渲染统一由 game.private_message 事件处理（避免本地 push + 事件推送重复）
+                    await WS.send('game.private_chat', { room_code: roomCode.value, to_number: to, content: txt });
+                    privateText.value = '';
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function skipPrivate() {
+                try {
+                    await WS.send('game.skip_private', { room_code: roomCode.value });
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            function backToRoom() {
+                overDialog.value = false;
+                leaveGameView();
+                view.value = 'room';
+            }
+
+            // ——— 好友系统（E 模块） ———
+            async function openFriendPanel() {
+                friendDialog.value = true;
+                searchResult.value = null;
+                friendSearch.value = '';
+                await refreshFriendList();
+            }
+            async function refreshFriendList() {
+                try {
+                    const ack = await WS.send('friend.list', {});
+                    friendList.friends = ack.friends || [];
+                    friendList.incoming = ack.incoming || [];
+                    friendList.outgoing = ack.outgoing || [];
+                } catch (e) { /* 忽略 */ }
+            }
+            async function doFriendSearch() {
+                const kw = friendSearch.value.trim();
+                if (!kw) return;
+                try {
+                    const ack = await WS.send('friend.search', { username: kw });
+                    searchResult.value = { user: ack.user, friendship_status: ack.friendship_status };
+                } catch (e) { searchResult.value = null; toast(e.message, 'error'); }
+            }
+            async function sendFriendRequest(uid) {
+                try {
+                    await WS.send('friend.request', { friend_id: uid });
+                    toast('好友申请已发送', 'success');
+                    await doFriendSearch();
+                    await refreshFriendList();
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function acceptFriend(uid) {
+                try {
+                    await WS.send('friend.accept', { friend_id: uid });
+                    toast('已添加为好友', 'success');
+                    await refreshFriendList();
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function rejectFriend(uid) {
+                try {
+                    await WS.send('friend.reject', { friend_id: uid });
+                    await refreshFriendList();
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function removeFriend(uid) {
+                try {
+                    await WS.send('friend.remove', { friend_id: uid });
+                    toast('已删除好友', 'info');
+                    await refreshFriendList();
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function openInviteDialog() {
+                await refreshFriendList();
+                inviteDialog.value = true;
+            }
+            async function sendInvite(uid) {
+                try {
+                    await WS.send('room.invite_friend', { room_code: roomCode.value, friend_id: uid });
+                    toast('邀请已发送', 'success');
+                } catch (e) { toast(e.message, 'error'); }
+            }
+            async function acceptInvite() {
+                if (!inviteIncoming.value) return;
+                const code = inviteIncoming.value.room_code;
+                try {
+                    const ack = await WS.send('room.invite_accept', { room_code: code });
+                    inviteIncoming.value = null;
+                    roomCode.value = code;
+                    applyRoomState(ack.state);
+                    sessionStorage.setItem('botc_room', code);
+                    view.value = 'room';
+                    toast('已加入房间', 'success');
+                } catch (e) {
+                    inviteIncoming.value = null;
+                    toast(e.message, 'error');
+                }
+            }
+            async function rejectInvite() {
+                if (!inviteIncoming.value) return;
+                const code = inviteIncoming.value.room_code;
+                inviteIncoming.value = null;
+                try { await WS.send('room.invite_reject', { room_code: code }); } catch (e) { /* 忽略 */ }
+            }
+
+            // ——— WS 事件订阅 ———
+            WS.on('_open', () => {
+                wsReady.value = true;
+                // 断线重连后自动恢复当前房间状态
+                if ((view.value === 'room' || view.value === 'game') && roomCode.value) {
+                    joinRoomWS().then(ack => {
+                        if (ack.state) applyRoomState(ack.state);
+                        if (ack.game && ack.game.game && view.value === 'game') applyGameState(ack.game);
+                    }).catch(() => {});
+                }
+            });
+            WS.on('_close', () => { wsReady.value = false; });
+
+            WS.on('room.state', (d) => {
+                if (view.value === 'room') applyRoomState(d);
+            });
+            WS.on('room.message', (d) => {
+                if (view.value === 'room') roomMessages.value.push(d);
+            });
+            WS.on('room.disbanded', () => {
+                if (view.value === 'room') {
+                    sessionStorage.removeItem('botc_room');
+                    view.value = 'lobby';
+                    room.value = null;
+                    toast('房间已解散', 'info');
+                }
+            });
+            WS.on('room.kicked', () => {
+                sessionStorage.removeItem('botc_room');
+                room.value = null;
+                roomCode.value = '';
+                view.value = 'lobby';
+                toast('你已被房主移出房间', 'warning');
+            });
+            WS.on('game.started', () => {
+                if (roomCode.value) { gameTab.value = 'public'; enterGame(); }
+            });
+            WS.on('game.state', (d) => {
+                if (view.value === 'game') applyGameState(d);
+            });
+            // 自己的角色/阵营（快照脱敏后单独下发）：用于自己座位上的角色图标 + 顶部/笔记信息
+            WS.on('game.self', (d) => {
+                if (view.value !== 'game' || !game.value || !game.value.players) return;
+                const p = Object.values(game.value.players).find(x => x.number === d.number);
+                if (p) {
+                    p.role = d.role; p.role_name = d.role_name; p.team = d.team;
+                    p.fake_role = d.fake_role; p.drunk = d.drunk;
+                }
+                if (!myNumber.value) myNumber.value = d.number;
+                if (d.role_name) myInfo.value.my_role = d.role_name;
+                if (d.team) myInfo.value.my_team = d.team;
+            });
+            WS.on('game.state_update', (d) => {
+                if (view.value === 'game' && game.value) {
+                    game.value.phase = d.phase;
+                    game.value.day = d.day;
+                    if (d.players) game.value.players = d.players;
+                }
+            });
+            WS.on('game.phase', (d) => {
+                if (view.value === 'game') applyPhaseResult(d);
+            });
+            WS.on('game.message', (d) => {
+                if (view.value === 'game') {
+                    pubMsgs.value.push(d);
+                    scrollMsgs();
+                }
+            });
+            WS.on('game.nominate', (d) => {
+                if (view.value !== 'game') return;
+                if (d.special) {
+                    toast(d.message, 'info');
+                    return;
+                }
+                // 提名/辩论信息由系统消息与投票条展示，不再弹窗
+            });
+            WS.on('game.story', (d) => {
+                // 单独的「天亮了」不记；完整的天亮播报（谁死了/存活几人）记进「我的笔记」
+                const c = String(d.content || '').trim();
+                if (/^(🌅\s*)?天亮了?$/.test(c)) return;
+                stories.value.push(d.content);
+                if (stories.value.length > 100) stories.value = stories.value.slice(-100);
+            });
+            WS.on('game.over', (d) => {
+                winner.value = d.winner;
+                overDialog.value = true;
+                // 电子斗蛐蛐：对局结束自动拉取完整对局记录
+                if (watchMode.value) fetchArenaRecord();
+            });
+            // 斗蛐蛐上帝视角：AI 私聊全量推送
+            WS.on('game.watch_private', (d) => {
+                watchPrivateMsgs.value.push(normPM(d));
+                if (watchPrivateMsgs.value.length > 300) watchPrivateMsgs.value = watchPrivateMsgs.value.slice(-300);
+            });
+            // 斗蛐蛐上帝视角：说书人/技能全量推送
+            WS.on('game.watch_story', (d) => {
+                if (BAD_STORY.test(d.content || '')) return; // 身份/天亮类不进记录
+                var day = (d.day != null) ? d.day : (game.value ? game.value.day : 0);
+                var ts = d.ts || Date.now();
+                // 去重（同一天同一条）
+                if (!watchStories.value.some(function(x){ return x.content === d.content && x.day === day; })) {
+                    watchStories.value.push({ number: d.number, day: day, content: d.content, ts: ts });
+                    // 保持时间顺序
+                    watchStories.value.sort(function(a, b){ return (a.ts || 0) - (b.ts || 0); });
+                }
+            });
+            async function fetchArenaRecord() {
+                try {
+                    const r = await api.get('/api/games');
+                    const g = (r.data.games || []).find(x => x.room_code === roomCode.value);
+                    if (!g) return;
+                    const rep = await api.get('/api/games/' + g.id + '/replay');
+                    arenaRecord.value = rep.data;
+                    arenaRecordDialog.value = true;
+                } catch (e) { /* 忽略 */ }
+            }
+            function closeArenaRecord() {
+                arenaRecordDialog.value = false;
+                arenaRecord.value = null;
+            }
+            // 导出对局记录为 Word 文档（HTML 格式 .doc，Word/WPS 可直接打开）
+            function exportArenaRecord() {
+                const r = arenaRecord.value;
+                if (!r) return;
+                const esc = (v) => String(v == null ? '' : v).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+                const pls = Object.values(r.players || {});
+                let html = '<html xmlns:o="urn:schemas-microsoft-com:office:office" xmlns:w="urn:schemas-microsoft-com:office:word">'
+                    + '<head><meta charset="utf-8"><title>对局记录</title></head><body>';
+                html += '<h1 style="text-align:center;">血染钟楼 · 对局记录</h1>';
+                html += '<p><b>房间：</b>' + esc(r.room_code) + '　<b>共</b> ' + esc(r.day) + ' <b>天</b>　<b>胜利方：</b>'
+                    + (r.winner === 'good' ? '善良阵营' : '邪恶阵营')
+                    + '<br/><b>开始时间：</b>' + esc(r.started_at || '') + '</p>';
+                html += '<h2>一、说书人复盘（AI）</h2>';
+                html += r.recap ? '<p>' + esc(r.recap) + '</p>' : '<p>（生成中或不可用）</p>';
+                html += '<h2>二、角色状态</h2><ul>';
+                for (const pl of pls) {
+                    html += '<li>#' + esc(pl.number) + ' ' + esc(pl.username || '') + ' — '
+                        + esc(pl.role === 'drunk' ? '酒鬼' : (pl.role_name || ''))
+                        + '（' + (pl.alive ? '存活' : '死亡') + '）</li>';
+                }
+                html += '</ul>';
+                html += '<h2>三、技能与说书人记录</h2>';
+                const stKeys = Object.keys(r.stories || {});
+                if (stKeys.length) {
+                    for (const k of stKeys) for (const st of (r.stories[k] || [])) html += '<p>#' + esc(k) + '：' + esc(st) + '</p>';
+                } else html += '<p>（无）</p>';
+                html += '<h2>四、公聊记录</h2>';
+                for (const m of (r.messages || [])) {
+                    html += '<p>' + (m.system ? '<b style="color:#b8860b;">[系统]</b> ' : '<b>#' + esc(m.number) + '：</b>') + esc(m.content) + '</p>';
+                }
+                html += '<h2>五、私聊记录</h2>';
+                if ((r.private_msgs || []).length) {
+                    for (const pm of r.private_msgs) {
+                        html += '<p><b>#' + esc(pm.from) + ' → #' + esc(pm.to) + '</b>（第 ' + ((pm.day || 0) + 1) + ' 天）：' + esc(pm.content) + '</p>';
+                    }
+                } else html += '<p>（无）</p>';
+                html += '</body></html>';
+                const blob = new Blob(['\ufeff' + html], { type: 'application/msword;charset=utf-8' });
+                const a = document.createElement('a');
+                a.href = URL.createObjectURL(blob);
+                a.download = '对局记录_' + (r.room_code || 'game') + '.doc';
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(a.href);
+                toast('对局记录已导出', 'success');
+            }
+            WS.on('room.ended', (d) => {
+                if (view.value === 'game') {
+                    view.value = 'room';
+                    toast('对局已结束', 'info');
+                }
+            });
+
+            // ——— 好友系统事件（E 模块） ———
+            WS.on('friend.request', (d) => {
+                toast(d.username + ' 申请加你为好友，去好友面板处理', 'info');
+                if (friendDialog.value) refreshFriendList();
+            });
+            WS.on('friend.accepted', (d) => {
+                toast('你和 ' + d.username + ' 已成为好友', 'success');
+                if (friendDialog.value) refreshFriendList();
+            });
+            WS.on('friend.removed', (d) => {
+                toast(d.username + ' 删除了你们的好友关系', 'info');
+                if (friendDialog.value) refreshFriendList();
+            });
+            WS.on('friend.online', (d) => {
+                const target = friendList.friends.find(f => f.user_id === d.user_id);
+                if (target) target.is_online = d.is_online;
+            });
+            WS.on('room.invite', (d) => {
+                inviteIncoming.value = { room_code: d.room_code, from: d.from };
+            });
+            WS.on('game.night_tip', (d) => {
+                if (view.value !== 'game') return;
+                addNightTip(d);
+                // 夜晚行动提示走「私聊」频道：自动切到私聊标签并提醒
+                if (!watchMode.value) gameTab.value = 'private';
+                toast('🔮 轮到你行动：请在「私聊」里选择目标', 'info');
+                scrollMsgs();
+                // 确认收到卡片：服务端从此刻重新计时，并同步更新本地卡片倒计时
+                WS.send('game.tip_ack', { room_code: roomCode.value }).then(ack => {
+                    if (ack && ack.deadline) {
+                        for (const m of pubMsgs.value) {
+                            if (m.tip_id === d.tip_id && m.nightTip) {
+                                m.nightTip.deadline = ack.deadline;
+                                m.nightTip.left = Math.max(0, Math.floor(ack.deadline - Date.now() / 1000));
+                            }
+                        }
+                    }
+                }).catch(() => {});
+            });
+            // ——— 提名投票事件 ———
+            let voteCountdownTimer = null;
+            function startVoteCountdown() {
+                if (voteCountdownTimer) clearInterval(voteCountdownTimer);
+                const tick = () => {
+                    let any = false;
+                    for (const m of pubMsgs.value) {
+                        if (m.voteCard && !m.voteCard.done) {
+                            any = true;
+                            m.voteCard.left = Math.max(0, Math.floor(m.voteCard.deadline - Date.now() / 1000));
+                        }
+                    }
+                    if (!any) clearInterval(voteCountdownTimer);
+                };
+                tick();
+                voteCountdownTimer = setInterval(tick, 400);
+            }
+            WS.on('game.nominate', (d) => {
+                if (view.value !== 'game') return;
+                if (d.special) {
+                    toast(d.message, 'info');
+                    return;
+                }
+                if (d.nominated && d.debate) {
+                    // 提名系统卡片：进入辩论阶段（仅双方可发言，20 秒后自动投票）
+                    pubMsgs.value.push({
+                        id: 'nm' + (++tipSeq),
+                        number: 0, system: true,
+                        content: '⚖️ 辩论开始：# ' + d.from + ' 提名了 #' + d.target,
+                        nominateCard: {
+                            from: d.from, target: d.target,
+                            deadline: d.debate_deadline,
+                            isParty: myNumber.value === d.from || myNumber.value === d.target,
+                            left: Math.max(0, Math.floor(((d.debate_deadline || Date.now() / 1000) - Date.now() / 1000))),
+                        },
+                    });
+                    voteInfo.value = {
+                        from: d.from, target: d.target, waiting: false,
+                        debate: true, debateDeadline: d.debate_deadline,
+                    };
+                    startDebateCountdown();
+                }
+            });
+            let debateCountdownTimer = null;
+            function startDebateCountdown() {
+                if (debateCountdownTimer) clearInterval(debateCountdownTimer);
+                const tick = () => {
+                    if (!voteInfo.value || !voteInfo.value.debate || voteInfo.value.waiting) {
+                        clearInterval(debateCountdownTimer);
+                        return;
+                    }
+                    const left = voteInfo.value.debateDeadline - Math.floor(Date.now() / 1000);
+                    debateCountdown.value = Math.max(0, left);
+                    // 同步提名卡片倒计时
+                    for (const m of pubMsgs.value) {
+                        if (m.nominateCard) {
+                            m.nominateCard.left = Math.max(0, Math.floor(m.nominateCard.deadline - Date.now() / 1000));
+                        }
+                    }
+                    if (left <= 0) {
+                        clearInterval(debateCountdownTimer);
+                    }
+                };
+                tick();
+                debateCountdownTimer = setInterval(tick, 400);
+            }
+            WS.on('game.vote_start', (d) => {
+                if (view.value !== 'game') return;
+                // 说书人投票系统卡片（公聊消息流内展示，仅非辩论双方可操作）
+                pubMsgs.value.push({
+                    id: 'vc' + (++tipSeq),
+                    number: 0, system: true,
+                    content: '',
+                    voteCard: {
+                        from: d.from, target: d.target,
+                        deadline: d.deadline,
+                        mine: false, done: false,
+                        isParty: false, // 规则更新：提名者和被提名者也可以投票
+                        left: Math.max(0, Math.floor(((d.deadline || Date.now() / 1000) - Date.now() / 1000))),
+                        total: Math.max(1, Math.floor(((d.deadline || Date.now() / 1000) - Date.now() / 1000))),
+                    },
+                });
+                startVoteCountdown();
+                scrollMsgs();
+            });
+            WS.on('game.vote_result', (d) => {
+                // 结果文本由后端系统消息进时间轴；此处只标记投票卡片完成并停止倒计时
+                for (const m of pubMsgs.value) {
+                    if (m.voteCard && !m.voteCard.done) m.voteCard.done = true;
+                }
+                if (voteCountdownTimer) clearInterval(voteCountdownTimer);
+                // 生成醒目的投票结果卡片
+                pubMsgs.value.push({
+                    id: 'vr' + (++tipSeq),
+                    number: 0, system: true,
+                    voteResultCard: {
+                        from: d.from, target: d.target,
+                        yes: d.yes || 0, abstain: d.abstain || 0,
+                        yesNums: d.yes_nums || [],
+                        unvotedNums: d.unvoted_nums || [],
+                        myUnvoted: (d.unvoted_nums || []).indexOf(myNumber.value) >= 0,
+                        executed: !!d.executed,
+                    },
+                });
+                scrollMsgs();
+            });
+            WS.on('game.nominate_result', (d) => {
+                voteInfo.value = null;
+                // 处决/提名结束：文本由后端系统消息进时间轴，前端不再 push 重复卡片
+                scrollMsgs();
+            });
+            // ——— 私聊事件 ———
+            WS.on('game.private_message', (d) => {
+                if (view.value !== 'game') return;
+                const other = d.from_number === myNumber.value ? d.to_number : d.from_number;
+                if (!privateChats[other]) privateChats[other] = [];
+                privateChats[other].push({
+                    from_number: d.from_number,
+                    to_number: d.to_number,
+                    content: d.content,
+                    mine: d.from_number === myNumber.value,
+                });
+                // 内存保护：每个私聊会话最多保留 100 条
+                if (privateChats[other].length > 100) {
+                    privateChats[other] = privateChats[other].slice(-100);
+                }
+                if (!privateTarget.value) privateTarget.value = other;
+                // 私聊模式中收到非当前对象的私聊 → 提示（不打断当前对话）
+                if (activePrivateTarget.value && other !== activePrivateTarget.value && !(d.from_number === myNumber.value)) {
+                    toast('#' + d.from_number + ' 私聊了你：' + d.content.slice(0, 30), 'info');
+                }
+                // 不在私聊模式且收到对方消息 → 提示可点击玩家条目进入
+                if (!activePrivateTarget.value && !(d.from_number === myNumber.value)) {
+                    toast('#' + d.from_number + ' 私聊了你，可在右栏「私聊」查看', 'info');
+                }
+            });
+            WS.on('game.private_invite', (d) => {
+                if (view.value !== 'game') return;
+                privateIncoming.value = { from_number: d.from_number };
+                toast('#' + d.from_number + ' 邀请你私聊', 'info');
+            });
+            WS.on('game.private_accepted', (d) => {
+                privateInviteWaiting.value = null;
+                privatePartners.value = [...new Set([...privatePartners.value, d.partner])];
+                if (!privateChats[d.partner]) privateChats[d.partner] = [];
+                if (!privateTarget.value) privateTarget.value = d.partner;
+                // 对方接受邀请：直接进入私聊对话
+                openPrivateConversation(d.partner);
+                toast('#' + d.partner + ' 接受了你的私聊邀请', 'success');
+            });
+            WS.on('game.private_declined', (d) => {
+                privateInviteWaiting.value = null;
+                toast('#' + d.by_number + ' 拒绝了你的私聊邀请', 'info');
+            });
+
+            // ——— 初始化 ———
+            (async function init() {
+                // 邀请链接：#join=ROOMCODE 自动填入房码
+                const h = location.hash || '';
+                const jm = h.match(/join=([A-Z0-9]{6})/i);
+                if (jm) {
+                    joinCode.value = jm[1].toUpperCase();
+                    history.replaceState(null, '', location.pathname);
+                    toast('检测到邀请链接，已填入房间码 ' + jm[1].toUpperCase(), 'info');
+                }
+                try {
+                    const d = await api.get('/api/me');
+                    if (d.data && d.data.user) {
+                        user.value = d.data.user;
+                        WS.connect();
+                        const savedRoom = sessionStorage.getItem('botc_room');
+                        if (savedRoom) {
+                            // 刷新恢复：回到之前所在的房间/对局
+                            try {
+                                roomCode.value = savedRoom;
+                                await ensureWS();
+                                const ack = await joinRoomWS();
+                                applyRoomState(ack.state);
+                                if (ack.game && ack.game.game) {
+                                    applyGameState(ack.game);
+                                    enterGameState();
+                                } else {
+                                    view.value = 'room';
+                                }
+                            } catch (e) {
+                                sessionStorage.removeItem('botc_room');
+                                view.value = 'lobby';
+                            }
+                        } else {
+                            view.value = 'lobby';
+                        }
+                    }
+                } catch (e) { /* 未登录 */ }
+            })();
+
+            // ——— 鼠标追踪聚光灯（spotlight 卡片） ———
+            document.addEventListener('mousemove', (e) => {
+                const target = e.target && e.target.closest ? e.target.closest('.spotlight') : null;
+                if (!target) return;
+                const rect = target.getBoundingClientRect();
+                target.style.setProperty('--mx', (e.clientX - rect.left) + 'px');
+                target.style.setProperty('--my', (e.clientY - rect.top) + 'px');
+            }, { passive: true });
+
+            return {
+                view, user, busy, loginForm, isRegister, joinCode, wsReady,
+                roomCode, room, roomMessages, chatText, seatCount,
+                onSeatDragStart, onSeatDrop, onSeatDragEnter, onSeatDragEnd, dragOverIdx,
+                askAiChat, askAiInput, askAiTarget, askAiBusy, askAiPlayer, sendAskAi,
+                game, myNumber, pubMsgs, gameChatText, myInfo, stories, myNotes, nightInfo,
+                infoDialog, overDialog, winner,
+                statsDialog, stats, myGames, replayDialog, replay, openStatsPanel, openReplay, modelStats, modelStatsDialog, openModelStats,
+                friendDialog, friendList, friendSearch, searchResult,
+                inviteDialog, inviteIncoming, inviteIncomingVisible,
+                voteInfo, voteCountdown, debateCountdown, castVote, endNomination,
+                privatePhase, privatePanelVisible, privateChats, privateTarget, privateText,
+                activePrivateTarget, exitPrivateChat, roomPlayers, activePrivateChats,
+                privatePartners, privateInviteWaiting, privateIncoming,
+                pickPrivateTarget, invitePrivate, acceptPrivate, declinePrivate, sendPrivateMsg, skipPrivate, leavePrivatePhase,
+                collapsePrivatePanel, openPrivatePanel,
+                isHost, myReady, sortedPlayers, phaseLabel, phaseTagClass, teamName, aliveCount, canSpeakNow, visibleMsgs, nameOf, isSlayerDecl, activeCard, activeCardType,
+                doLogin, doLogout, createRoom, createArena, joinRoom: joinRoomByCode,
+                captchaCode, refreshCaptcha, fetchMe,
+                leaderboardDialog, leaderboard, openLeaderboard,
+                announcementsDialog, announcements, openAnnouncements,
+                watchMode, watchPrivateMsgs, watchStories, arenaRecord, arenaRecordDialog, fetchArenaRecord, closeArenaRecord, exportArenaRecord,
+                watchSessions, watchActiveSession, watchActiveMsgs, openWatchSession, watchNameOf, watchTab,
+                gameTab, panelTitle, openPrivateConversation, switchTab, lastPrivateMsg,
+                nightCountdown, nightCountdownPct, nightCountdownMode, nomIdleLeft, cdPos, startCdDrag, phaseLeft,
+                myNotesText, saveMyNotes, scriptInfo, teamLabel,
+                slayerDialog, slayerTarget, mySlayerUsable, openSlayerDialog, confirmSlayerShoot,
+                layoutMode, toggleLayout, circlePlayers, roomCirclePlayers, measureCircleArea, teamCounts,
+                sendRoomMsg, toggleReady, addAI, removeAI, kickPlayer, setSeats, startGame, leaveRoom,
+                llmDialog, llmPresets, llmForm, llmModelOptions, openLlmDialog, pickLlmPreset, confirmAddLlmAI, usage, roomUsage, fetchUsage, fmtTokens, llmBusy, pingLlm, pingResult, roomAIList, humanList,
+                aiCount: (r) => r.players.filter(p => p.is_ai).length,
+                sendGameMsg, nextPhase, nominate, endGame, backToRoom, atMenuVisible, onChatInput, insertAt,
+                guessLabels, guessMenuFor, openGuessMenu, setMark, clearMark, markOf, roleIcon, hasRoleIcon, ALL_ROLES, nominateHead, nominateReason,
+                clickPlayer, copyRoomLink,
+                openFriendPanel, refreshFriendList, doFriendSearch, sendFriendRequest,
+                acceptFriend, rejectFriend, removeFriend,
+                openInviteDialog, sendInvite, acceptInvite, rejectInvite,
+                toggleTipTarget, submitTipChoice,
+            };
+        },
+    });
+    const appInstance = app.use(ElementPlus).mount('#app');
+    // —— 环形座位容器尺寸自适应：容器尺寸变化时自动重算座位坐标（圆桌/环形视图） ——
+    (function setupCircleResize(){
+        const observed = new WeakSet();
+        const ro = new ResizeObserver(function(){ try { appInstance.measureCircleArea(); } catch(e) {} });
+        function observeIfPresent(){
+            ['circle-area', 'circle-area-room'].forEach(function(id){
+                const el = document.getElementById(id);
+                if (el && !observed.has(el)) { observed.add(el); ro.observe(el); }
+            });
+        }
+        observeIfPresent();
+        new MutationObserver(observeIfPresent).observe(document.body, { childList: true, subtree: true });
+        window.addEventListener('resize', function(){ observeIfPresent(); try { appInstance.measureCircleArea(); } catch(e) {} });
+    })();
+    // —— 挂载后初始化：验证码渲染 + 会话恢复（通过组件实例访问 setup 暴露值） ——
+    fetch('/api/captcha').then(r => r.json()).then(d => {
+        if (d.data && d.data.captcha) {
+            const code = d.data.captcha;
+            const cv = document.getElementById('captchaCanvas');
+            if (cv) {
+                const ctx = cv.getContext('2d');
+                ctx.fillStyle = '#101013';
+                ctx.fillRect(0, 0, cv.width, cv.height);
+                for (let i = 0; i < 6; i++) {
+                    ctx.strokeStyle = 'rgba(' + (120 + Math.random() * 120) + ',' + (120 + Math.random() * 120) + ',' + (150 + Math.random() * 100) + ',0.6)';
+                    ctx.beginPath();
+                    ctx.moveTo(Math.random() * cv.width, Math.random() * cv.height);
+                    ctx.lineTo(Math.random() * cv.width, Math.random() * cv.height);
+                    ctx.stroke();
+                }
+                const colors = ['#a5aef0', '#e8b23c', '#7ecb9c', '#ee9aa4'];
+                for (let i = 0; i < 4; i++) {
+                    ctx.save();
+                    ctx.font = 'bold 22px monospace';
+                    ctx.fillStyle = colors[i];
+                    ctx.translate(16 + i * 24, 26 + Math.random() * 6 - 3);
+                    ctx.rotate((Math.random() - 0.5) * 0.5);
+                    ctx.fillText(code[i] || '', 0, 0);
+                    ctx.restore();
+                }
+            }
+        }
+    }).catch(() => {});
+    fetch('/api/me').then(r => r.json()).then(d => {
+        if (d.data && d.data.user && d.data.user.id) {
+            appInstance.user = d.data.user;
+            appInstance.view = 'lobby';
+        }
+    }).catch(() => {});
+})();
