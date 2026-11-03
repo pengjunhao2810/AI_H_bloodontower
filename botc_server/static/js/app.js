@@ -839,7 +839,7 @@
                 { key: 'openrouter', label: 'OpenRouter（有免费模型）', base_url: 'https://openrouter.ai/api/v1', model: 'deepseek/deepseek-chat-v3-0324:free', needKey: true,
                   models: ['deepseek/deepseek-chat-v3-0324:free', 'deepseek/deepseek-r1:free', 'meta-llama/llama-3.3-70b-instruct:free', 'qwen/qwen-2.5-72b-instruct'] },
                 { key: 'ollama', label: 'Ollama 本地（免费离线）', base_url: 'http://127.0.0.1:11434/v1', model: 'qwen2.5:7b', needKey: false,
-                  models: ['qwen2.5:7b', 'qwen2.5:14b', 'llama3.1:8b', 'deepseek-r1:7b'] },
+                  models: ['qwen2.5-3b', 'qwen2.5-0.5b', 'qwen2.5:7b', 'qwen2.5:14b', 'llama3.1:8b', 'deepseek-r1:7b'] },
             ];
             const llmForm = reactive({ provider: 'deepseek', api_key: '', base_url: '', model: '' });
             const llmModelOptions = computed(() => {
